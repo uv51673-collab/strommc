@@ -2,19 +2,26 @@
 //
 // Config (all via .env):
 //   GEMINI_API_KEY           required; if empty the AI feature is simply disabled
-//   GEMINI_MODEL             optional; defaults to DEFAULT_MODEL below
+//   GEMINI_MODEL             optional; main model, defaults to DEFAULT_MODEL below
+//   GEMINI_FALLBACK_MODELS   optional; comma-separated backup models tried when the main model is
+//                            overloaded (503), too slow, rate limited (429) or missing (404).
+//                            Set it to an empty value to turn the fallbacks off.
 //   GEMINI_TIMEOUT_MS        optional; timeout of ONE request (default 30000)
 //   GEMINI_TOTAL_TIMEOUT_MS  optional; budget for a whole question incl. retries (default 50000)
 //   GEMINI_RETRY_DELAY_MS    optional; wait before the 1st retry, doubles for the 2nd (default 1500)
 //   BOT_DISPLAY_NAME         optional; name the AI uses for itself (default "Strommc bot")
 //
 // Google sometimes answers 503 ("high demand") or is slow. Those are temporary, so the
-// request is retried automatically (up to 3 tries). Key/model/quota errors are NOT retried.
+// question is retried automatically, switching to a backup model first (each model has its
+// own capacity). A wrong/blocked API key (400/401/403) is never retried.
 
 import { logger } from '../utils/logger.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_MODEL = 'gemini-3.8-flash';
+// Stable models from Google's model list. The main model goes first; the others are tried
+// in this order when it fails (a model that is already the main one is not repeated).
+const DEFAULT_FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.6-flash'];
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_TOTAL_TIMEOUT_MS = 50000;
 const DEFAULT_RETRY_DELAY_MS = 1500;
@@ -70,11 +77,24 @@ export function splitForDiscord(text, limit = DISCORD_MESSAGE_LIMIT) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function userError(message, userMessage, { retryable = false, cause } = {}) {
+// retryable: temporary problem, the same model may work again shortly.
+// skipModel: this model will not work for this question (missing / rate limited), but another one might.
+function userError(message, userMessage, { retryable = false, skipModel = false, cause } = {}) {
   const error = new Error(message, cause ? { cause } : undefined);
   error.userMessage = userMessage;
   error.retryable = retryable;
+  error.skipModel = skipModel;
   return error;
+}
+
+function getModelList() {
+  const primary = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
+  const rawFallbacks = process.env.GEMINI_FALLBACK_MODELS;
+  const fallbacks =
+    rawFallbacks === undefined
+      ? DEFAULT_FALLBACK_MODELS
+      : rawFallbacks.split(',').map((name) => name.trim()).filter(Boolean);
+  return [...new Set([primary, ...fallbacks])];
 }
 
 /**
@@ -134,6 +154,7 @@ async function requestOnce({ apiKey, model, prompt, timeoutMs }) {
     }
     throw userError(`Gemini API error ${response.status}: ${apiMessage}`, userMessage, {
       retryable: RETRYABLE_STATUS.has(response.status),
+      skipModel: response.status === 404 || response.status === 429,
     });
   }
 
@@ -174,7 +195,7 @@ export async function askGemini(question) {
     throw userError('Empty question', 'Please ask me a question.');
   }
 
-  const model = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
+  const models = getModelList();
   const timeoutMs = Number(process.env.GEMINI_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
   const totalMs = Number(process.env.GEMINI_TOTAL_TIMEOUT_MS) || DEFAULT_TOTAL_TIMEOUT_MS;
   const baseDelayMs = Number(process.env.GEMINI_RETRY_DELAY_MS) || DEFAULT_RETRY_DELAY_MS;
@@ -182,31 +203,71 @@ export async function askGemini(question) {
   const startedAt = Date.now();
   const remainingMs = () => totalMs - (Date.now() - startedAt);
 
+  // With backup models: two full rounds over them. With a single model: MAX_ATTEMPTS tries.
+  const maxRequests = models.length === 1 ? MAX_ATTEMPTS : models.length * 2;
+  const unusableModels = new Set(); // 404 / 429 for this question: do not ask them again
+
+  let requests = 0;
+  let pos = 0; // position inside the current round over the usable models
+  let rounds = 0; // completed rounds
+  let roundHadTemporaryFailure = false;
   let lastError;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    if (remainingMs() < MIN_USEFUL_ATTEMPT_MS) {
+
+  while (requests < maxRequests && remainingMs() >= MIN_USEFUL_ATTEMPT_MS) {
+    const usable = models.filter((name) => !unusableModels.has(name));
+    if (usable.length === 0) {
       break;
     }
+    if (pos >= usable.length) {
+      pos = 0;
+    }
+
+    const model = usable[pos];
+    pos++;
+    requests++;
 
     try {
-      return await requestOnce({
+      const text = await requestOnce({
         apiKey,
         model,
         prompt,
         timeoutMs: Math.min(timeoutMs, remainingMs()),
       });
+      if (requests > 1) {
+        logger.info(`Gemini answered with model ${model} (request ${requests})`);
+      }
+      return text;
     } catch (error) {
       lastError = error;
-      if (!error.retryable || attempt === MAX_ATTEMPTS) {
+
+      if (error.skipModel && !error.retryable) {
+        unusableModels.add(model);
+        pos--; // the next model moved into this slot
+      } else if (error.retryable) {
+        roundHadTemporaryFailure = true;
+      } else {
+        throw error; // wrong key, empty answer, etc. — another model will not help
+      }
+
+      const stillUsable = models.filter((name) => !unusableModels.has(name));
+      if (stillUsable.length === 0 || requests >= maxRequests) {
         throw error;
       }
 
-      const delayMs = baseDelayMs * 2 ** (attempt - 1);
-      if (remainingMs() < delayMs + MIN_USEFUL_ATTEMPT_MS) {
-        throw error;
+      // Switching to another model needs no waiting; wait only after a full round of them.
+      if (pos >= stillUsable.length) {
+        const delayMs = baseDelayMs * 2 ** rounds;
+        rounds++;
+        pos = 0;
+        if (roundHadTemporaryFailure) {
+          if (remainingMs() < delayMs + MIN_USEFUL_ATTEMPT_MS) {
+            throw error;
+          }
+          logger.info(`All Gemini models busy, retrying in ${delayMs}ms (request ${requests + 1}/${maxRequests})`);
+          await sleep(delayMs);
+        }
+        roundHadTemporaryFailure = false;
       }
-      logger.info(`Retrying Gemini request (attempt ${attempt + 1}/${MAX_ATTEMPTS}) in ${delayMs}ms`);
-      await sleep(delayMs);
     }
   }
 
