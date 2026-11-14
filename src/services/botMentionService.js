@@ -64,11 +64,18 @@ function stripBotMention(content, botId) {
 // Replies must never ping anyone (the AI could output <@id>, @everyone, etc.).
 const SAFE_MENTIONS = { parse: [], repliedUser: false };
 
+const TYPING_REFRESH_MS = 8000; // Discord's typing indicator lasts ~10s
+
 async function answerQuestion(message, question) {
+  // Keep the "typing..." indicator alive while Gemini (and any retries) take their time.
+  const keepTyping = () => message.channel.sendTyping().catch(() => {});
+  const typingTimer = setInterval(keepTyping, TYPING_REFRESH_MS);
+
   try {
-    await message.channel.sendTyping().catch(() => {});
+    await keepTyping();
 
     const answer = await askGemini(question);
+    clearInterval(typingTimer);
     const chunks = splitForDiscord(answer).slice(0, MAX_REPLY_CHUNKS);
 
     let first = true;
@@ -81,6 +88,7 @@ async function answerQuestion(message, question) {
       }
     }
   } catch (error) {
+    clearInterval(typingTimer);
     const userMessage = error?.userMessage || 'Something went wrong while answering. Please try again.';
     if (!error?.userMessage) {
       logger.error('Unexpected error while answering a bot mention:', error);
