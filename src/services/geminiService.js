@@ -1,16 +1,26 @@
 // geminiService.js — answers staff questions through the Google Gemini API.
 //
 // Config (all via .env):
-//   GEMINI_API_KEY      required; if empty the AI feature is simply disabled
-//   GEMINI_MODEL        optional; defaults to DEFAULT_MODEL below
-//   GEMINI_TIMEOUT_MS   optional; request timeout (default 20000)
-//   BOT_DISPLAY_NAME    optional; name the AI uses for itself (default "Strommc bot")
+//   GEMINI_API_KEY           required; if empty the AI feature is simply disabled
+//   GEMINI_MODEL             optional; defaults to DEFAULT_MODEL below
+//   GEMINI_TIMEOUT_MS        optional; timeout of ONE request (default 30000)
+//   GEMINI_TOTAL_TIMEOUT_MS  optional; budget for a whole question incl. retries (default 50000)
+//   GEMINI_RETRY_DELAY_MS    optional; wait before the 1st retry, doubles for the 2nd (default 1500)
+//   BOT_DISPLAY_NAME         optional; name the AI uses for itself (default "Strommc bot")
+//
+// Google sometimes answers 503 ("high demand") or is slow. Those are temporary, so the
+// request is retried automatically (up to 3 tries). Key/model/quota errors are NOT retried.
 
 import { logger } from '../utils/logger.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_MODEL = 'gemini-3.8-flash';
-const DEFAULT_TIMEOUT_MS = 20000;
+const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_TOTAL_TIMEOUT_MS = 50000;
+const DEFAULT_RETRY_DELAY_MS = 1500;
+const MAX_ATTEMPTS = 3;
+const MIN_USEFUL_ATTEMPT_MS = 3000;
+const RETRYABLE_STATUS = new Set([500, 502, 503, 504]);
 const DISCORD_MESSAGE_LIMIT = 2000;
 const MAX_QUESTION_LENGTH = 1500;
 
@@ -58,28 +68,19 @@ export function splitForDiscord(text, limit = DISCORD_MESSAGE_LIMIT) {
   return chunks;
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function userError(message, userMessage, { retryable = false, cause } = {}) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.userMessage = userMessage;
+  error.retryable = retryable;
+  return error;
+}
+
 /**
- * Ask Gemini a question. Returns the answer text.
- * Throws an Error with a user-safe `userMessage` on failure; the API key is never logged.
+ * One single request to Gemini. Throws an error with `userMessage` and `retryable`.
  */
-export async function askGemini(question) {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) {
-    const error = new Error('GEMINI_API_KEY is not set');
-    error.userMessage = 'AI is not configured yet. Ask the bot owner to add the Gemini API key.';
-    throw error;
-  }
-
-  const prompt = String(question ?? '').trim().slice(0, MAX_QUESTION_LENGTH);
-  if (!prompt) {
-    const error = new Error('Empty question');
-    error.userMessage = 'Please ask me a question.';
-    throw error;
-  }
-
-  const model = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
-  const timeoutMs = Number(process.env.GEMINI_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
-
+async function requestOnce({ apiKey, model, prompt, timeoutMs }) {
   let response;
   try {
     response = await fetch(`${API_BASE}/${encodeURIComponent(model)}:generateContent`, {
@@ -91,18 +92,21 @@ export async function askGemini(question) {
       body: JSON.stringify({
         system_instruction: { parts: [{ text: buildSystemInstruction() }] },
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 800, temperature: 0.7 },
+        // Newer Gemini models "think" first and thinking tokens count towards this limit.
+        generationConfig: { maxOutputTokens: 2048, temperature: 0.7 },
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (cause) {
     const timedOut = cause?.name === 'TimeoutError' || cause?.name === 'AbortError';
     logger.warn(`Gemini request failed (${timedOut ? 'timeout' : cause?.message || 'network error'})`);
-    const error = new Error('Gemini request failed', { cause });
-    error.userMessage = timedOut
-      ? 'The AI took too long to answer. Please try again.'
-      : 'I could not reach the AI service. Please try again in a moment.';
-    throw error;
+    throw userError(
+      'Gemini request failed',
+      timedOut
+        ? 'The AI took too long to answer. Please try again.'
+        : 'I could not reach the AI service. Please try again in a moment.',
+      { retryable: true, cause },
+    );
   }
 
   let data = null;
@@ -115,17 +119,22 @@ export async function askGemini(question) {
   if (!response.ok) {
     const apiMessage = data?.error?.message || response.statusText;
     logger.warn(`Gemini API error ${response.status} (model: ${model}): ${apiMessage}`);
-    const error = new Error(`Gemini API error ${response.status}: ${apiMessage}`);
+
+    let userMessage;
     if (response.status === 429) {
-      error.userMessage = 'The AI is busy right now (rate limit). Please try again shortly.';
+      userMessage = 'The AI is busy right now (rate limit). Please try again shortly.';
+    } else if (response.status === 503) {
+      userMessage = 'The AI is under heavy load right now. Please try again in a moment.';
     } else if (response.status === 400 || response.status === 401 || response.status === 403) {
-      error.userMessage = 'The AI key looks invalid or not allowed. Ask the bot owner to check it.';
+      userMessage = 'The AI key looks invalid or not allowed. Ask the bot owner to check it.';
     } else if (response.status === 404) {
-      error.userMessage = 'The configured AI model was not found. Ask the bot owner to check GEMINI_MODEL.';
+      userMessage = 'The configured AI model was not found. Ask the bot owner to check GEMINI_MODEL.';
     } else {
-      error.userMessage = 'The AI service had a problem. Please try again in a moment.';
+      userMessage = 'The AI service had a problem. Please try again in a moment.';
     }
-    throw error;
+    throw userError(`Gemini API error ${response.status}: ${apiMessage}`, userMessage, {
+      retryable: RETRYABLE_STATUS.has(response.status),
+    });
   }
 
   const candidate = data?.candidates?.[0];
@@ -137,10 +146,69 @@ export async function askGemini(question) {
   if (!text) {
     const blocked = data?.promptFeedback?.blockReason || candidate?.finishReason;
     logger.warn(`Gemini returned no text (reason: ${blocked || 'unknown'})`);
-    const error = new Error('Gemini returned an empty response');
-    error.userMessage = 'I could not come up with an answer for that. Try rephrasing your question.';
-    throw error;
+    throw userError(
+      'Gemini returned an empty response',
+      'I could not come up with an answer for that. Try rephrasing your question.',
+    );
   }
 
   return text;
+}
+
+/**
+ * Ask Gemini a question. Returns the answer text.
+ * Temporary failures (503/500/502/504, timeouts, network errors) are retried automatically.
+ * Throws an Error with a user-safe `userMessage` on failure; the API key is never logged.
+ */
+export async function askGemini(question) {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey) {
+    throw userError(
+      'GEMINI_API_KEY is not set',
+      'AI is not configured yet. Ask the bot owner to add the Gemini API key.',
+    );
+  }
+
+  const prompt = String(question ?? '').trim().slice(0, MAX_QUESTION_LENGTH);
+  if (!prompt) {
+    throw userError('Empty question', 'Please ask me a question.');
+  }
+
+  const model = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
+  const timeoutMs = Number(process.env.GEMINI_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
+  const totalMs = Number(process.env.GEMINI_TOTAL_TIMEOUT_MS) || DEFAULT_TOTAL_TIMEOUT_MS;
+  const baseDelayMs = Number(process.env.GEMINI_RETRY_DELAY_MS) || DEFAULT_RETRY_DELAY_MS;
+
+  const startedAt = Date.now();
+  const remainingMs = () => totalMs - (Date.now() - startedAt);
+
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (remainingMs() < MIN_USEFUL_ATTEMPT_MS) {
+      break;
+    }
+
+    try {
+      return await requestOnce({
+        apiKey,
+        model,
+        prompt,
+        timeoutMs: Math.min(timeoutMs, remainingMs()),
+      });
+    } catch (error) {
+      lastError = error;
+      if (!error.retryable || attempt === MAX_ATTEMPTS) {
+        throw error;
+      }
+
+      const delayMs = baseDelayMs * 2 ** (attempt - 1);
+      if (remainingMs() < delayMs + MIN_USEFUL_ATTEMPT_MS) {
+        throw error;
+      }
+      logger.info(`Retrying Gemini request (attempt ${attempt + 1}/${MAX_ATTEMPTS}) in ${delayMs}ms`);
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError ?? userError('Gemini request failed', 'The AI took too long to answer. Please try again.');
 }
