@@ -6,8 +6,10 @@
 //   GEMINI_FALLBACK_MODELS   optional; comma-separated backup models tried when the main model is
 //                            overloaded (503), too slow, rate limited (429) or missing (404).
 //                            Set it to an empty value to turn the fallbacks off.
-//   GEMINI_TIMEOUT_MS        optional; timeout of ONE request (default 30000)
-//   GEMINI_TOTAL_TIMEOUT_MS  optional; budget for a whole question incl. retries (default 50000)
+//   GEMINI_THINKING_LEVEL    optional; minimal|low|medium|high for every model, or "default" to send
+//                            nothing. Lower = faster answers. Unset = a sensible level per model.
+//   GEMINI_TIMEOUT_MS        optional; timeout of ONE request (default 15000)
+//   GEMINI_TOTAL_TIMEOUT_MS  optional; budget for a whole question incl. retries (default 45000)
 //   GEMINI_RETRY_DELAY_MS    optional; wait before the 1st retry, doubles for the 2nd (default 1500)
 //   BOT_DISPLAY_NAME         optional; name the AI uses for itself (default "Strommc bot")
 //
@@ -21,9 +23,16 @@ const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const DEFAULT_MODEL = 'gemini-3.8-flash';
 // Stable models from Google's model list. The main model goes first; the others are tried
 // in this order when it fails (a model that is already the main one is not repeated).
+// How hard each model "thinks" before answering (per Google's thinking guide). Less thinking = faster.
+// gemini-3.8-flash defaults to "medium" and rejects "minimal", so it gets "low"; gemini-3.6-flash accepts
+// "minimal"; the flash-lite models already default to "minimal". Custom model names send nothing.
+const THINKING_LEVELS = {
+  'gemini-3.8-flash': 'low',
+  'gemini-3.6-flash': 'minimal',
+};
 const DEFAULT_FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.6-flash'];
-const DEFAULT_TIMEOUT_MS = 30000;
-const DEFAULT_TOTAL_TIMEOUT_MS = 50000;
+const DEFAULT_TIMEOUT_MS = 15000;
+const DEFAULT_TOTAL_TIMEOUT_MS = 45000;
 const DEFAULT_RETRY_DELAY_MS = 1500;
 const MAX_ATTEMPTS = 3;
 const MIN_USEFUL_ATTEMPT_MS = 3000;
@@ -87,6 +96,14 @@ function userError(message, userMessage, { retryable = false, skipModel = false,
   return error;
 }
 
+function getThinkingLevel(model) {
+  const override = process.env.GEMINI_THINKING_LEVEL?.trim().toLowerCase();
+  if (override) {
+    return override === 'default' ? undefined : override;
+  }
+  return THINKING_LEVELS[model];
+}
+
 function getModelList() {
   const primary = process.env.GEMINI_MODEL?.trim() || DEFAULT_MODEL;
   const rawFallbacks = process.env.GEMINI_FALLBACK_MODELS;
@@ -100,7 +117,7 @@ function getModelList() {
 /**
  * One single request to Gemini. Throws an error with `userMessage` and `retryable`.
  */
-async function requestOnce({ apiKey, model, prompt, timeoutMs }) {
+async function requestOnce({ apiKey, model, prompt, timeoutMs, thinkingLevel }) {
   let response;
   try {
     response = await fetch(`${API_BASE}/${encodeURIComponent(model)}:generateContent`, {
@@ -113,7 +130,11 @@ async function requestOnce({ apiKey, model, prompt, timeoutMs }) {
         system_instruction: { parts: [{ text: buildSystemInstruction() }] },
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         // Newer Gemini models "think" first and thinking tokens count towards this limit.
-        generationConfig: { maxOutputTokens: 2048, temperature: 0.7 },
+        generationConfig: {
+          maxOutputTokens: 2048,
+          temperature: 0.7,
+          ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
+        },
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -152,10 +173,13 @@ async function requestOnce({ apiKey, model, prompt, timeoutMs }) {
     } else {
       userMessage = 'The AI service had a problem. Please try again in a moment.';
     }
-    throw userError(`Gemini API error ${response.status}: ${apiMessage}`, userMessage, {
+    const error = userError(`Gemini API error ${response.status}: ${apiMessage}`, userMessage, {
       retryable: RETRYABLE_STATUS.has(response.status),
       skipModel: response.status === 404 || response.status === 429,
     });
+    // A 400 about the thinking setting is not a key problem: the caller retries without it.
+    error.thinkingRejected = Boolean(thinkingLevel) && response.status === 400 && /think/i.test(apiMessage);
+    throw error;
   }
 
   const candidate = data?.candidates?.[0];
@@ -206,6 +230,7 @@ export async function askGemini(question) {
   // With backup models: two full rounds over them. With a single model: MAX_ATTEMPTS tries.
   const maxRequests = models.length === 1 ? MAX_ATTEMPTS : models.length * 2;
   const unusableModels = new Set(); // 404 / 429 for this question: do not ask them again
+  const withoutThinkingConfig = new Set(); // models that rejected the thinking setting
 
   let requests = 0;
   let pos = 0; // position inside the current round over the usable models
@@ -232,6 +257,7 @@ export async function askGemini(question) {
         model,
         prompt,
         timeoutMs: Math.min(timeoutMs, remainingMs()),
+        thinkingLevel: withoutThinkingConfig.has(model) ? undefined : getThinkingLevel(model),
       });
       if (requests > 1) {
         logger.info(`Gemini answered with model ${model} (request ${requests})`);
@@ -239,6 +265,13 @@ export async function askGemini(question) {
       return text;
     } catch (error) {
       lastError = error;
+
+      if (error.thinkingRejected && !withoutThinkingConfig.has(model) && requests < maxRequests) {
+        logger.warn(`Gemini model ${model} rejected thinking level; retrying it without that setting`);
+        withoutThinkingConfig.add(model);
+        pos--; // ask the same model again, this time without the thinking setting
+        continue;
+      }
 
       if (error.skipModel && !error.retryable) {
         unusableModels.add(model);
