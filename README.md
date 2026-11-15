@@ -152,6 +152,12 @@ Staff can ping the bot to talk to it:
 
 Set `GEMINI_API_KEY` in `.env` (key from [Google AI Studio](https://aistudio.google.com/apikey)). Only staff are answered — anyone with Administrator, Manage Server, Manage Messages, Timeout, Kick or Ban permission, bot owners (`OWNER_IDS`), and roles listed in `STAFF_ROLE_IDS`. Everyone else's pings are ignored. Each staff member is limited to 5 questions per minute. Optional: `GEMINI_MODEL`, `GEMINI_TIMEOUT_MS`, `BOT_DISPLAY_NAME`.
 
+### AI server builder (`/aisetup`)
+
+`/aisetup request:<what your server is about>` lets Gemini design categories plus text and voice channels, picking the emojis itself. The bot shows a preview, and nothing is created until you press **Create everything**. Creation then runs with a live progress embed (created / failed / skipped) and a final summary.
+
+Needs **Manage Channels** for both you and the bot, and `GEMINI_API_KEY`. Existing categories and channels are never duplicated or deleted. Limits per run: 6 categories, 8 channels each, 30 items total.
+
 ### Using GitHub Container Registry
 
 The bot is automatically published to GitHub Container Registry on every push to main.
