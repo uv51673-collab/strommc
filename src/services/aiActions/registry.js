@@ -36,6 +36,7 @@ import {
   isPowerfulRole,
 } from './helpers.js';
 import { MANAGE_ACTIONS } from './manageActions.js';
+import { BRIDGE_ACTIONS } from './bridgeActions.js';
 
 const KINDS = new Set(['text', 'voice', 'announcement', 'forum', 'stage']);
 const TYPE_BY_KIND = {
@@ -540,4 +541,4 @@ function resolveSendTarget(a, env) {
   return found;
 }
 
-export const ACTION_TYPES = { ...CORE_ACTIONS, ...MANAGE_ACTIONS };
+export const ACTION_TYPES = { ...CORE_ACTIONS, ...MANAGE_ACTIONS, ...BRIDGE_ACTIONS };
