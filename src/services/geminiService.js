@@ -118,7 +118,7 @@ function getModelList() {
 /**
  * One single request to Gemini. Throws an error with `userMessage` and `retryable`.
  */
-async function requestOnce({ apiKey, model, prompt, timeoutMs, thinkingLevel }) {
+async function requestOnce({ apiKey, model, prompt, timeoutMs, thinkingLevel, systemInstruction, maxOutputTokens = 2048, json = false }) {
   let response;
   try {
     response = await fetch(`${API_BASE}/${encodeURIComponent(model)}:generateContent`, {
@@ -128,12 +128,13 @@ async function requestOnce({ apiKey, model, prompt, timeoutMs, thinkingLevel }) 
         'x-goog-api-key': apiKey,
       },
       body: JSON.stringify({
-        system_instruction: { parts: [{ text: buildSystemInstruction() }] },
+        system_instruction: { parts: [{ text: systemInstruction || buildSystemInstruction() }] },
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         // Newer Gemini models "think" first and thinking tokens count towards this limit.
         generationConfig: {
-          maxOutputTokens: 2048,
-          temperature: 0.7,
+          maxOutputTokens,
+          temperature: json ? 0.8 : 0.7,
+          ...(json ? { responseMimeType: 'application/json' } : {}),
           ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
         },
       }),
@@ -206,7 +207,8 @@ async function requestOnce({ apiKey, model, prompt, timeoutMs, thinkingLevel }) 
  * Temporary failures (503/500/502/504, timeouts, network errors) are retried automatically.
  * Throws an Error with a user-safe `userMessage` on failure; the API key is never logged.
  */
-export async function askGemini(question) {
+export async function askGemini(question, options = {}) {
+  const { systemInstruction, maxOutputTokens, json = false, maxQuestionLength, totalTimeoutMs } = options;
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
     throw userError(
@@ -215,14 +217,14 @@ export async function askGemini(question) {
     );
   }
 
-  const prompt = String(question ?? '').trim().slice(0, MAX_QUESTION_LENGTH);
+  const prompt = String(question ?? '').trim().slice(0, maxQuestionLength || MAX_QUESTION_LENGTH);
   if (!prompt) {
     throw userError('Empty question', 'Please ask me a question.');
   }
 
   const models = getModelList();
   const timeoutMs = Number(process.env.GEMINI_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
-  const totalMs = Number(process.env.GEMINI_TOTAL_TIMEOUT_MS) || DEFAULT_TOTAL_TIMEOUT_MS;
+  const totalMs = totalTimeoutMs || Number(process.env.GEMINI_TOTAL_TIMEOUT_MS) || DEFAULT_TOTAL_TIMEOUT_MS;
   const baseDelayMs = Number(process.env.GEMINI_RETRY_DELAY_MS) || DEFAULT_RETRY_DELAY_MS;
 
   const startedAt = Date.now();
@@ -257,7 +259,10 @@ export async function askGemini(question) {
         apiKey,
         model,
         prompt,
-        timeoutMs: Math.min(timeoutMs, remainingMs()),
+        timeoutMs: Math.min(totalTimeoutMs ? Math.max(timeoutMs, 25000) : timeoutMs, remainingMs()),
+        systemInstruction,
+        maxOutputTokens,
+        json,
         thinkingLevel: withoutThinkingConfig.has(model) ? undefined : getThinkingLevel(model),
       });
       if (requests > 1) {
