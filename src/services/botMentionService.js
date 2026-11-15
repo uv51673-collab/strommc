@@ -17,6 +17,7 @@ import {
   isGeminiConfigured,
   splitForDiscord,
 } from './geminiService.js';
+import { handleActionRequest, looksLikeActionRequest } from './aiActionService.js';
 
 const AI_RATE_LIMIT_ATTEMPTS = 5;
 const AI_RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -166,6 +167,13 @@ export async function handleBotMention(message, client) {
         allowedMentions: SAFE_MENTIONS,
       })
       .catch(() => {});
+    return true;
+  }
+
+  // Orders like "kick @user" or "make a private channel" go to the action handler;
+  // plain questions keep the fast answer path. Both run in the background.
+  if (looksLikeActionRequest(question)) {
+    void handleActionRequest(message, question);
     return true;
   }
 
