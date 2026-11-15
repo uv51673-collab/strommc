@@ -32,17 +32,18 @@ const SAFE_MENTIONS = { parse: [], repliedUser: false };
 const COLORS = { info: 0x5865f2, ok: 0x57f287, warn: 0xfee75c, error: 0xed4245 };
 
 // Cheap local check so ordinary questions keep their fast path (no extra AI call).
-const ACTION_WORDS = /\b(kick|ban|timeout|mute|unmute|purge|delete|rename|assign|role|roles|channel|channels|category|categories|voice|forum|stage|announcement|announcements|private|community|banao|bana|nikalo|nikal|hatao|send|bhej|bhejo|bhejna|post|announce|msg|paste|edit|likh|likho|daal|dal|audit|report|nickname|nick|move|event|events|topic|color|colour|humans|bots|disconnect|tournament|members)\b/i;
+const ACTION_WORDS = /\b(kick|ban|timeout|mute|unmute|purge|delete|rename|assign|role|roles|channel|channels|category|categories|voice|forum|stage|announcement|announcements|private|community|banao|bana|nikalo|nikal|hatao|send|bhej|bhejo|bhejna|post|announce|msg|paste|edit|likh|likho|daal|dal|audit|report|nickname|nick|move|event|events|topic|color|colour|humans|bots|disconnect|tournament|members|welcome|goodbye|verification|verify|ticket|tickets|giveaway|logging|logs|setup|autorole|panel|log)\b/i;
 export function looksLikeActionRequest(text) {
   return ACTION_WORDS.test(String(text ?? ''));
 }
 
-function buildSystemInstruction() {
+function buildSystemInstruction(client) {
   return [
     'You turn a Discord staff member\'s message into JSON actions. Reply with JSON only, no markdown.',
     'Schema: {"reply":"short answer in the staff member\'s language","actions":[ ...actions ]}',
     'Allowed actions (use exactly these shapes):',
-    ...Object.values(ACTION_TYPES).map((entry) => `- ${entry.prompt}`),
+    ...Object.values(ACTION_TYPES).flatMap((entry) => (entry.prompt ? [`- ${entry.prompt}`] : (entry.promptLines?.(client) ?? []))),
+    'run_command sets up existing systems (welcome, goodbye, verification, tickets, logging, giveaways, auto-role). Use only the exact command/option names above; channels and roles by name or id.',
     'Rules: only use user IDs from "mentionedUsers". Never invent users. Channels may be referenced by id or name from "channels".',
     '"private" = only the listed roles, the requester and the bot can see it. "community" or normal = public.',
     'If the staff member says "this / ise / isko / ye" without giving text, they mean "repliedMessage" in the context: use its text (polish it) as the content.',
@@ -96,7 +97,10 @@ export function checkPermissions(action, invoker, botMember) {
   return null;
 }
 
-export const isRisky = (action) => Boolean(ACTION_TYPES[action.type]?.risky);
+export const isRisky = (action) => {
+  const risky = ACTION_TYPES[action.type]?.risky;
+  return typeof risky === 'function' ? Boolean(risky(action)) : Boolean(risky);
+};
 const describe = (action) => ACTION_TYPES[action.type].describe(action);
 const label = (action) => action.type.replace(/_/g, ' ');
 
@@ -138,7 +142,7 @@ export async function planActions(message, text, replied = null) {
   };
 
   const answer = await askGemini(`Staff message: ${text}\n\nContext (JSON): ${JSON.stringify(context)}`, {
-    systemInstruction: buildSystemInstruction(),
+    systemInstruction: buildSystemInstruction(message.client),
     maxOutputTokens: 2048,
     json: true,
     maxQuestionLength: 6000,
