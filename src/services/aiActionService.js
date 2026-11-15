@@ -1,17 +1,19 @@
 // aiActionService.js — lets staff give the bot orders in plain words by pinging it:
-//   "@Bot kick @user for spamming", "@Bot ban @user", "@Bot make a private channel for @Mods",
-//   "@Bot community announcements channel under Info".
+//   "@Bot kick @user for spamming", "@Bot timeout @user 10 min", "@Bot delete last 20 messages",
+//   "@Bot make a private channel for @Mods", "@Bot give @user the VIP role" ...
+// What the bot can do is defined in aiActions/registry.js.
 //
 // Safety model (the AI only *suggests*, code decides):
-//  * The model returns JSON; every action is validated and whitelisted here.
-//  * kick/ban targets must be users actually mentioned in the message (no invented IDs).
-//  * The staff member needs the real Discord permission, the bot needs it too, and the normal
-//    role-hierarchy checks of ModerationService apply.
-//  * kick/ban always wait for a Confirm button press from the person who asked.
+//  * The model returns JSON; every action is validated and whitelisted by the registry.
+//  * User targets must be users actually mentioned in the message (no invented IDs).
+//  * The staff member AND the bot need the real Discord permission; role hierarchy applies.
+//  * If any action is risky (kick, ban, purge, deletes) the whole batch waits for a Confirm
+//    button from the person who asked. Safe batches run directly. Either way a result embed
+//    lists everything that happened.
+//  * Nothing here locks or restricts chat.
 
 import {
   ChannelType,
-  PermissionFlagsBits,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -19,40 +21,35 @@ import {
   EmbedBuilder,
 } from 'discord.js';
 import { askGemini } from './geminiService.js';
-import { ModerationService } from './moderation/moderationService.js';
-import {
-  normalizeName,
-  composeCategoryName,
-  composeTextName,
-  composeVoiceName,
-} from './aiServerSetupService.js';
+import { ACTION_TYPES } from './aiActions/registry.js';
+import { cleanText } from './aiActions/helpers.js';
+import { normalizeName } from './aiServerSetupService.js';
 import { logger } from '../utils/logger.js';
 
-export const ACTION_LIMITS = { maxActions: 5, maxModeration: 3, confirmMs: 60000 };
+export const ACTION_LIMITS = { maxActions: 10, maxModeration: 5, confirmMs: 60000 };
 
 const SAFE_MENTIONS = { parse: [], repliedUser: false };
 const COLORS = { info: 0x5865f2, ok: 0x57f287, warn: 0xfee75c, error: 0xed4245 };
-const EMOJI_ONLY = /^(?:\p{Extended_Pictographic}️?(?:‍\p{Extended_Pictographic}️?)*)$/u;
-const KINDS = new Set(['text', 'voice', 'announcement', 'forum', 'stage']);
 
 // Cheap local check so ordinary questions keep their fast path (no extra AI call).
-const ACTION_WORDS = /\b(kick|ban|channel|channels|category|categories|voice|forum|stage|announcement|announcements|private|community|banao|bana|nikalo|nikal|hatao)\b/i;
+const ACTION_WORDS = /\b(kick|ban|timeout|mute|unmute|purge|delete|rename|assign|role|roles|channel|channels|category|categories|voice|forum|stage|announcement|announcements|private|community|banao|bana|nikalo|nikal|hatao)\b/i;
 export function looksLikeActionRequest(text) {
   return ACTION_WORDS.test(String(text ?? ''));
 }
 
-const SYSTEM_INSTRUCTION = [
-  'You turn a Discord staff member\'s message into JSON actions. Reply with JSON only, no markdown.',
-  'Schema: {"reply":"short answer in the staff member\'s language","actions":[',
-  '{"type":"kick","userId":"<id from mentioned users>","reason":"short"},',
-  '{"type":"ban","userId":"<id from mentioned users>","reason":"short"},',
-  '{"type":"create_channel","name":"words","kind":"text|voice|announcement|forum|stage","privacy":"public|private","emoji":"one emoji","category":"category name or null","allowedRoles":["role names"],"topic":"short"},',
-  '{"type":"create_category","name":"words","emoji":"one emoji","privacy":"public|private","allowedRoles":["role names"]}]}',
-  'Rules: only use user IDs from the "mentionedUsers" list. Never invent users.',
-  '"private" = only the listed roles, the requester and the bot can see it. "community" or normal = public.',
-  'Pick a fitting emoji yourself. If the message is just a question or you cannot do it, return an empty actions list and put a short helpful answer (under 400 characters) in "reply".',
-  'At most 5 actions. Reply in the same language as the staff member (Hinglish is fine).',
-].join('\n');
+function buildSystemInstruction() {
+  return [
+    'You turn a Discord staff member\'s message into JSON actions. Reply with JSON only, no markdown.',
+    'Schema: {"reply":"short answer in the staff member\'s language","actions":[ ...actions ]}',
+    'Allowed actions (use exactly these shapes):',
+    ...Object.values(ACTION_TYPES).map((entry) => `- ${entry.prompt}`),
+    'Rules: only use user IDs from "mentionedUsers". Never invent users. Channels may be referenced by id or name from "channels".',
+    '"private" = only the listed roles, the requester and the bot can see it. "community" or normal = public.',
+    'Pick fitting emojis yourself. You can never lock channels, change permissions or give admin rights.',
+    `If the message is just a question or you cannot do it, return an empty actions list and put a short helpful answer (under 400 characters) in "reply". At most ${ACTION_LIMITS.maxActions} actions.`,
+    'Reply in the same language as the staff member (Hinglish is fine).',
+  ].join('\n');
+}
 
 /** Validates the model output. Pure function: no Discord calls. */
 export function sanitizeActions(raw, ctx) {
@@ -63,91 +60,41 @@ export function sanitizeActions(raw, ctx) {
 
   for (const item of list.slice(0, ACTION_LIMITS.maxActions)) {
     const type = String(item?.type ?? '');
+    const entry = Object.hasOwn(ACTION_TYPES, type) ? ACTION_TYPES[type] : null;
+    if (!entry) {
+      refused.push(`unknown action "${type.slice(0, 20)}"`);
+      continue;
+    }
 
-    if (type === 'kick' || type === 'ban') {
-      const userId = String(item?.userId ?? '');
-      if (!ctx.mentionedUserIds.has(userId)) {
-        refused.push(`${type}: that user was not mentioned in your message`);
-        continue;
-      }
-      if (userId === ctx.botId || userId === ctx.invokerId) {
-        refused.push(`${type}: I will not do that to ${userId === ctx.botId ? 'myself' : 'you'}`);
-        continue;
-      }
+    const result = entry.sanitize(item, ctx);
+    if (typeof result === 'string') {
+      refused.push(result);
+      continue;
+    }
+    if (entry.group === 'moderation') {
       if (moderation >= ACTION_LIMITS.maxModeration) {
-        refused.push(`${type}: too many kicks/bans in one message (max ${ACTION_LIMITS.maxModeration})`);
+        refused.push(`${type}: too many moderation actions in one message (max ${ACTION_LIMITS.maxModeration})`);
         continue;
       }
       moderation++;
-      actions.push({
-        type,
-        userId,
-        reason: cleanText(item?.reason, 200) || 'Requested via bot ping',
-      });
-      continue;
     }
-
-    if (type === 'create_channel' || type === 'create_category') {
-      const name = cleanText(item?.name, 60);
-      if (!normalizeName(name)) {
-        refused.push('channel: no usable name');
-        continue;
-      }
-      const emoji = EMOJI_ONLY.test(String(item?.emoji ?? '').trim())
-        ? String(item.emoji).trim()
-        : null;
-      const privacy = String(item?.privacy).toLowerCase() === 'private' ? 'private' : 'public';
-      const allowedRoles = (Array.isArray(item?.allowedRoles) ? item.allowedRoles : [])
-        .map((r) => cleanText(r, 60))
-        .filter(Boolean)
-        .slice(0, 8);
-
-      if (type === 'create_category') {
-        actions.push({ type, name, emoji: emoji ?? '📁', privacy, allowedRoles });
-      } else {
-        const kind = KINDS.has(String(item?.kind).toLowerCase()) ? String(item.kind).toLowerCase() : 'text';
-        const defaultEmoji = kind === 'voice' || kind === 'stage' ? '🔊' : kind === 'announcement' ? '📢' : '💬';
-        actions.push({
-          type,
-          name,
-          kind,
-          privacy,
-          emoji: emoji ?? defaultEmoji,
-          category: cleanText(item?.category, 60) || null,
-          allowedRoles,
-          topic: cleanText(item?.topic, 200),
-        });
-      }
-      continue;
-    }
-
-    refused.push(`unknown action "${type.slice(0, 20)}"`);
+    actions.push(result);
   }
 
   return { actions, refused, reply: cleanText(raw?.reply, 600) };
 }
 
-function cleanText(value, max) {
-  return String(value ?? '')
-    .replace(/@(everyone|here)/gi, '')
-    .replace(/[<>`]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, max);
-}
-
 /** Does this staff member + the bot really have the permission for the action? */
 export function checkPermissions(action, invoker, botMember) {
-  const need =
-    action.type === 'kick'
-      ? [PermissionFlagsBits.KickMembers, 'Kick Members']
-      : action.type === 'ban'
-        ? [PermissionFlagsBits.BanMembers, 'Ban Members']
-        : [PermissionFlagsBits.ManageChannels, 'Manage Channels'];
-  if (!invoker?.permissions?.has(need[0])) return `you need the **${need[1]}** permission`;
-  if (!botMember?.permissions?.has(need[0])) return `I need the **${need[1]}** permission`;
+  const [flag, label] = ACTION_TYPES[action.type].permission;
+  if (!invoker?.permissions?.has(flag)) return `you need the **${label}** permission`;
+  if (!botMember?.permissions?.has(flag)) return `I need the **${label}** permission`;
   return null;
 }
+
+export const isRisky = (action) => Boolean(ACTION_TYPES[action.type]?.risky);
+const describe = (action) => ACTION_TYPES[action.type].describe(action);
+const label = (action) => action.type.replace(/_/g, ' ');
 
 function parseJson(text) {
   const trimmed = String(text ?? '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim();
@@ -161,144 +108,33 @@ function parseJson(text) {
   }
 }
 
-function describe(action) {
-  if (action.type === 'kick') return `👢 Kick <@${action.userId}> — ${action.reason}`;
-  if (action.type === 'ban') return `🔨 Ban <@${action.userId}> — ${action.reason}`;
-  const lock = action.privacy === 'private' ? '🔒 private' : '🌐 public';
-  if (action.type === 'create_category') return `📁 Category ${composeCategoryName(action.emoji, action.name)} (${lock})`;
-  const shown = action.kind === 'voice' || action.kind === 'stage'
-    ? composeVoiceName(action.emoji, action.name)
-    : composeTextName(action.emoji, action.name);
-  return `➕ ${action.kind} channel ${shown} (${lock})${action.category ? ` in ${action.category}` : ''}`;
-}
-
+// Plain EmbedBuilder data on purpose: the shared createEmbed() helper strips emojis.
 const embed = (color, title, description) =>
   new EmbedBuilder({ color: COLORS[color], title, description: String(description).slice(0, 4000) });
 
-function findRoleIds(guild, names) {
-  const ids = [];
-  for (const wanted of names) {
-    const key = normalizeName(wanted);
-    if (!key) continue;
-    const role = [...guild.roles.cache.values()].find(
-      (r) => r.id !== guild.id && (normalizeName(r.name) === key || r.id === wanted),
-    );
-    if (role) ids.push(role.id);
-  }
-  return ids;
-}
-
-function privateOverwrites(guild, invokerId, botId, roleIds) {
-  const see = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.Connect];
-  return [
-    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-    { id: invokerId, allow: see },
-    { id: botId, allow: [...see, PermissionFlagsBits.ManageChannels] },
-    ...roleIds.map((id) => ({ id, allow: see })),
-  ];
-}
-
-async function resolveCategory(guild, name, created) {
-  const key = normalizeName(name);
-  if (!key) return null;
-  const existing = [...guild.channels.cache.values()].find(
-    (c) => c.type === ChannelType.GuildCategory && normalizeName(c.name) === key,
-  );
-  if (existing) return existing.id;
-  if (created.has(key)) return created.get(key);
-  const made = await guild.channels.create({
-    name: composeCategoryName('📁', name),
-    type: ChannelType.GuildCategory,
-    reason: 'AI action (bot ping)',
-  });
-  created.set(key, made.id);
-  return made.id;
-}
-
-const TYPE_BY_KIND = {
-  text: ChannelType.GuildText,
-  voice: ChannelType.GuildVoice,
-  stage: ChannelType.GuildStageVoice,
-  announcement: ChannelType.GuildAnnouncement,
-  forum: ChannelType.GuildForum,
-};
-
-/** Runs one validated action. Returns a result line; throws on failure. */
-async function runAction(action, { message, guild, invoker, client, categoriesMade }) {
-  if (action.type === 'kick') {
-    const member = await guild.members.fetch(action.userId).catch(() => null);
-    if (!member) throw new Error('that person is not in the server');
-    await ModerationService.kickUser({ guild, member, moderator: invoker, reason: action.reason });
-    return `Kicked <@${action.userId}>`;
-  }
-
-  if (action.type === 'ban') {
-    const user = message.mentions.users.get(action.userId) ?? (await client.users.fetch(action.userId));
-    await ModerationService.banUser({ guild, user, moderator: invoker, reason: action.reason });
-    return `Banned <@${action.userId}>`;
-  }
-
-  const roleIds = findRoleIds(guild, action.allowedRoles ?? []);
-  const permissionOverwrites =
-    action.privacy === 'private' ? privateOverwrites(guild, invoker.id, client.user.id, roleIds) : undefined;
-
-  if (action.type === 'create_category') {
-    const made = await guild.channels.create({
-      name: composeCategoryName(action.emoji, action.name),
-      type: ChannelType.GuildCategory,
-      ...(permissionOverwrites ? { permissionOverwrites } : {}),
-      reason: `AI action requested by ${invoker.user.tag}`,
-    });
-    categoriesMade.set(normalizeName(action.name), made.id);
-    return `Created category ${made.name}`;
-  }
-
-  const parent = action.category ? await resolveCategory(guild, action.category, categoriesMade) : null;
-  const isVoiceLike = action.kind === 'voice' || action.kind === 'stage';
-  const name = isVoiceLike
-    ? composeVoiceName(action.emoji, action.name)
-    : composeTextName(action.emoji, action.name);
-
-  const base = {
-    name,
-    ...(parent ? { parent } : {}),
-    ...(permissionOverwrites ? { permissionOverwrites } : {}),
-    ...(action.topic && !isVoiceLike ? { topic: action.topic } : {}),
-    reason: `AI action requested by ${invoker.user.tag}`,
-  };
-
-  let note = '';
-  let made;
-  try {
-    made = await guild.channels.create({ ...base, type: TYPE_BY_KIND[action.kind] });
-  } catch (error) {
-    // Announcement / forum / stage need the Community feature; fall back to something that works.
-    if (action.kind === 'text') throw error;
-    const fallbackType = action.kind === 'stage' ? ChannelType.GuildVoice : ChannelType.GuildText;
-    made = await guild.channels.create({ ...base, type: fallbackType });
-    note = ` (made as ${action.kind === 'stage' ? 'voice' : 'text'} — ${action.kind} needs Community enabled)`;
-  }
-  return `Created ${action.privacy === 'private' ? '🔒 ' : ''}${made.name}${note}`;
-}
-
 /** Ask Gemini what the staff member wants. Throws an error with `userMessage` on failure. */
 export async function planActions(message, text) {
+  const { guild } = message;
   const mentionedUsers = [...message.mentions.users.values()]
     .filter((u) => u.id !== message.client.user.id)
     .map((u) => ({ id: u.id, tag: u.tag ?? u.username }));
   const context = {
     mentionedUsers,
     mentionedRoles: [...message.mentions.roles.values()].map((r) => r.name),
-    roles: [...message.guild.roles.cache.values()].filter((r) => r.id !== message.guild.id).slice(0, 25).map((r) => r.name),
-    categories: [...message.guild.channels.cache.values()]
-      .filter((c) => c.type === ChannelType.GuildCategory).slice(0, 25).map((c) => c.name),
+    roles: [...guild.roles.cache.values()].filter((r) => r.id !== guild.id && !r.managed).slice(0, 40).map((r) => r.name),
+    categories: [...guild.channels.cache.values()].filter((c) => c.type === ChannelType.GuildCategory).slice(0, 25).map((c) => c.name),
+    channels: [...guild.channels.cache.values()]
+      .filter((c) => c.type !== ChannelType.GuildCategory && !c.isThread?.())
+      .slice(0, 60)
+      .map((c) => ({ id: c.id, name: c.name })),
+    currentChannel: { id: message.channel.id, name: message.channel.name },
   };
 
   const answer = await askGemini(`Staff message: ${text}\n\nContext (JSON): ${JSON.stringify(context)}`, {
-    systemInstruction: SYSTEM_INSTRUCTION,
-    maxOutputTokens: 1024,
+    systemInstruction: buildSystemInstruction(),
+    maxOutputTokens: 2048,
     json: true,
-    maxQuestionLength: 4000,
+    maxQuestionLength: 6000,
     totalTimeoutMs: 30000,
   });
 
@@ -346,14 +182,24 @@ export async function handleActionRequest(message, text) {
       invokerId: message.author.id,
     });
 
+    // Roles created earlier in the same batch may be given/removed later in it.
+    const plannedRoles = new Set(actions.filter((a) => a.type === 'create_role').map((a) => normalizeName(a.name)));
+    const env = { message, guild, invoker, client, categoriesMade: new Map(), protectedIds: new Set([message.id]), plannedRoles };
+
     const allowed = [];
     for (const action of actions) {
-      const problem = checkPermissions(action, invoker, botMember);
-      if (problem) refused.push(`${action.type.replace('_', ' ')}: ${problem}`);
+      const entry = ACTION_TYPES[action.type];
+      const permissionProblem = checkPermissions(action, invoker, botMember);
+      const problem = permissionProblem
+        ? `${label(action)}: ${permissionProblem}`
+        : ((await entry.validate?.(action, env)) ?? null);
+      if (problem) refused.push(problem);
       else allowed.push(action);
     }
 
     clear();
+
+    const skipped = refused.length ? `\n\n*Skipped:*\n${refused.map((r) => `• ${r}`).join('\n')}` : '';
 
     if (!allowed.length) {
       const lines = refused.length ? `\n\n${refused.map((r) => `• ${r}`).join('\n')}` : '';
@@ -361,11 +207,10 @@ export async function handleActionRequest(message, text) {
       return;
     }
 
-    const risky = allowed.some((a) => a.type === 'kick' || a.type === 'ban');
-    const planText = allowed.map(describe).join('\n') + (refused.length ? `\n\n*Skipped:*\n${refused.map((r) => `• ${r}`).join('\n')}` : '');
-
+    const planText = allowed.map(describe).join('\n');
     let target = null; // message that will show the result
-    if (risky) {
+
+    if (allowed.some(isRisky)) {
       const buttons = (disabled) => [
         new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('aiact_confirm').setLabel('Confirm').setStyle(ButtonStyle.Danger).setDisabled(disabled),
@@ -373,10 +218,11 @@ export async function handleActionRequest(message, text) {
         ),
       ];
       target = await send({
-        embeds: [embed('warn', '⚠️ Confirm these actions', `${planText}\n\nOnly you can confirm. Expires in 60 seconds.`)],
+        embeds: [embed('warn', '⚠️ Confirm these actions', `${planText}${skipped}\n\nOnly you can confirm. Expires in 60 seconds.`)],
         components: buttons(false),
       });
       if (!target) return;
+      env.protectedIds.add(target.id);
 
       let click;
       try {
@@ -402,17 +248,16 @@ export async function handleActionRequest(message, text) {
 
     const lines = [];
     let failed = 0;
-    const categoriesMade = new Map();
     for (const action of allowed) {
       try {
-        lines.push(`✅ ${await runAction(action, { message, guild, invoker, client, categoriesMade })}`);
+        lines.push(`✅ ${await ACTION_TYPES[action.type].run(action, env)}`);
       } catch (error) {
         failed++;
         logger.warn(`ai action ${action.type} failed: ${error?.message}`);
         lines.push(`❌ ${describe(action)} — ${error?.userMessage || error?.message || 'failed'}`);
       }
     }
-    if (refused.length) lines.push(`\n*Skipped:*\n${refused.map((r) => `• ${r}`).join('\n')}`);
+    if (refused.length) lines.push(skipped.trim());
 
     const finalEmbed = embed(failed ? 'warn' : 'ok', failed ? 'Done, with problems' : '✅ Done', lines.join('\n'));
     if (target) await target.edit({ embeds: [finalEmbed], components: [] }).catch(() => send({ embeds: [finalEmbed] }));

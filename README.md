@@ -157,7 +157,8 @@ Set `GEMINI_API_KEY` in `.env` (key from [Google AI Studio](https://aistudio.goo
 Staff can also give orders in plain words, e.g. `@Bot kick @user spamming`, `@Bot ban @user`, `@Bot make a private channel for Mods`, `@Bot community announcements channel under Info`. Gemini only suggests actions; the bot checks them in code:
 
 - kick/ban targets must be users mentioned in the message, and both the staff member and the bot need the real Discord permission (Kick Members / Ban Members / Manage Channels). Normal role-hierarchy checks apply and cases are logged.
-- kick/ban always ask for a **Confirm** button from the requester (60 s). Channel creation runs directly.
+- Also supported: `timeout`/`untimeout`, `purge` (delete recent messages), create/delete/give/remove roles, rename/delete channels. Roles are created with no permissions, and a role with powerful permissions can only be handed out by an Administrator. There is no lock, slowmode or permission-editing action.
+- Risky actions (kick, ban, purge, deleting channels or roles) make the whole batch wait for Confirm; every batch ends with a result embed.
 - Channel kinds: text, voice, announcement, forum, stage; `private` hides it from @everyone and shows it to the named roles, the requester and the bot. Announcement/forum fall back to text if Community is not enabled.
 
 ### AI server builder (`/aisetup`)
