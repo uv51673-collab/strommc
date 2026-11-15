@@ -71,11 +71,18 @@ async function answerQuestion(message, question) {
   const keepTyping = () => message.channel.sendTyping().catch(() => {});
   const typingTimer = setInterval(keepTyping, TYPING_REFRESH_MS);
 
+  // Instant feedback: an hourglass on the question until the answer is posted.
+  const waitingReaction = await message.react('\u23F3').catch(() => null);
+  const clearWaiting = () => {
+    waitingReaction?.users?.remove(message.client.user.id).catch(() => {});
+  };
+
   try {
     await keepTyping();
 
     const answer = await askGemini(question);
     clearInterval(typingTimer);
+    clearWaiting();
     const chunks = splitForDiscord(answer).slice(0, MAX_REPLY_CHUNKS);
 
     let first = true;
@@ -89,6 +96,7 @@ async function answerQuestion(message, question) {
     }
   } catch (error) {
     clearInterval(typingTimer);
+    clearWaiting();
     const userMessage = error?.userMessage || 'Something went wrong while answering. Please try again.';
     if (!error?.userMessage) {
       logger.error('Unexpected error while answering a bot mention:', error);
