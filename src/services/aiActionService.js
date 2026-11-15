@@ -32,7 +32,7 @@ const SAFE_MENTIONS = { parse: [], repliedUser: false };
 const COLORS = { info: 0x5865f2, ok: 0x57f287, warn: 0xfee75c, error: 0xed4245 };
 
 // Cheap local check so ordinary questions keep their fast path (no extra AI call).
-const ACTION_WORDS = /\b(kick|ban|timeout|mute|unmute|purge|delete|rename|assign|role|roles|channel|channels|category|categories|voice|forum|stage|announcement|announcements|private|community|banao|bana|nikalo|nikal|hatao)\b/i;
+const ACTION_WORDS = /\b(kick|ban|timeout|mute|unmute|purge|delete|rename|assign|role|roles|channel|channels|category|categories|voice|forum|stage|announcement|announcements|private|community|banao|bana|nikalo|nikal|hatao|send|bhej|bhejo|bhejna|post|announce|msg|paste|edit|likh|likho|daal|dal)\b/i;
 export function looksLikeActionRequest(text) {
   return ACTION_WORDS.test(String(text ?? ''));
 }
@@ -127,6 +127,7 @@ export async function planActions(message, text) {
       .filter((c) => c.type !== ChannelType.GuildCategory && !c.isThread?.())
       .slice(0, 60)
       .map((c) => ({ id: c.id, name: c.name })),
+    mentionedChannels: [...(message.mentions.channels?.values?.() ?? [])].map((c) => ({ id: c.id, name: c.name })),
     currentChannel: { id: message.channel.id, name: message.channel.name },
   };
 

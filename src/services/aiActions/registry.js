@@ -12,7 +12,7 @@
 //
 // Gemini only *suggests*; nothing here trusts it.
 
-import { ChannelType, PermissionFlagsBits } from 'discord.js';
+import { ChannelType, PermissionFlagsBits, EmbedBuilder } from 'discord.js';
 import { ModerationService } from '../moderation/moderationService.js';
 import {
   normalizeName,
@@ -22,6 +22,8 @@ import {
 } from '../aiServerSetupService.js';
 import {
   cleanText,
+  cleanMessage,
+  cannotWriteIn,
   cleanEmoji,
   cleanRoleList,
   findRole,
@@ -147,6 +149,48 @@ export const ACTION_TYPES = {
       const deleted = await env.message.channel.bulkDelete(picked, true);
       const note = deleted.size < picked.length ? ' (messages older than 14 days cannot be bulk deleted)' : '';
       return `Deleted ${deleted.size} message(s)${note}`;
+    },
+  },
+
+  send_message: {
+    permission: [PermissionFlagsBits.SendMessages, 'Send Messages'],
+    risky: false,
+    prompt: '{"type":"send_message","channel":"<id or name from channels/mentionedChannels, or null for the current channel>","content":"the FINAL polished text to post","asEmbed":false,"title":"embed title or null","color":"#RRGGBB or null"}  (you write the final text: fix spelling/grammar, tidy the layout with line breaks, **bold** and fitting emojis, keep the meaning and language; never add @everyone/@here)',
+    sanitize(item) {
+      const asEmbed = item?.asEmbed === true;
+      const content = cleanMessage(item?.content, asEmbed ? 4000 : 1900);
+      if (!content) return 'send message: there is no text to send';
+      const color = /^#?[0-9a-f]{6}$/i.test(String(item?.color ?? '').trim())
+        ? parseInt(String(item.color).trim().replace('#', ''), 16)
+        : null;
+      return {
+        type: 'send_message',
+        channel: cleanText(item?.channel, 100) || null,
+        content,
+        asEmbed,
+        title: asEmbed ? cleanText(item?.title, 200) : '',
+        color,
+      };
+    },
+    describe: (a) =>
+      `📨 Send ${a.asEmbed ? 'an embed' : 'a message'} to ${a.channel ?? 'this channel'} (${a.content.length} chars)`,
+    async validate(a, env) {
+      const target = resolveSendTarget(a, env);
+      if (target.error) return `send message: ${target.error}`;
+      return (
+        cannotWriteIn(target.channel, env.invoker, 'you') ??
+        cannotWriteIn(target.channel, env.guild.members.me, 'I') ??
+        null
+      );
+    },
+    async run(a, env) {
+      const { channel } = resolveSendTarget(a, env);
+      const payload = a.asEmbed
+        ? { embeds: [new EmbedBuilder({ color: a.color ?? 0x5865f2, ...(a.title ? { title: a.title } : {}), description: a.content })] }
+        : { content: a.content };
+      // No pings from AI-written text: mentions render but never notify anyone.
+      const sent = await channel.send({ ...payload, allowedMentions: { parse: [] } });
+      return `Sent to <#${channel.id}>${sent?.url ? ` — [open message](${sent.url})` : ''}`;
     },
   },
 
@@ -380,4 +424,14 @@ function roleAssignment(type, method, verbEmoji, verbPast) {
       return `${verbPast} role ${role.name} ${type === 'give_role' ? 'to' : 'from'} <@${a.userId}>`;
     },
   };
+}
+
+function resolveSendTarget(a, env) {
+  if (!a.channel) return { channel: env.message.channel };
+  const found = findChannel(env.guild, a.channel);
+  if (found.error) return found;
+  if (!found.channel.isTextBased?.() || found.channel.type === ChannelType.GuildCategory) {
+    return { error: `#${found.channel.name} is not a channel I can post in` };
+  }
+  return found;
 }
