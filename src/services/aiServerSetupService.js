@@ -9,9 +9,9 @@ import { askGemini } from './geminiService.js';
 import { logger } from '../utils/logger.js';
 
 export const LIMITS = {
-  maxCategories: 6,
-  maxChannelsPerCategory: 8,
-  maxTotalChannels: 30,
+  maxCategories: 10,
+  maxChannelsPerCategory: 12,
+  maxTotalChannels: 50,
   guildChannelCap: 500,
   categoryChannelCap: 50,
   maxRequestLength: 400,
@@ -23,14 +23,17 @@ const DEFAULT_TEXT_EMOJI = '💬';
 const DEFAULT_VOICE_EMOJI = '🔊';
 
 const SYSTEM_INSTRUCTION = [
-  'You design Discord server layouts. Reply with JSON only, no markdown.',
-  'Schema: {"categories":[{"name":"INFO","emoji":"📢","channels":[{"name":"rules","type":"text","emoji":"📜","topic":"short topic"},{"name":"General","type":"voice","emoji":"🔊"}]}]}',
+  'You are a senior Discord community architect. You design professional server layouts. Reply with JSON only, no markdown.',
+  'Schema: {"categories":[{"name":"INFO","emoji":"📢","private":false,"allowedRoles":[],"channels":[{"name":"rules","type":"text","emoji":"📜","topic":"short topic"},{"name":"General","type":"voice","emoji":"🔊"}]}]}',
   'Rules: pick ONE fitting emoji per category and per channel yourself (a single emoji character, no text).',
   'Category names are short plain words (1-3 words). Text channel names are lowercase words, hyphens allowed.',
   'Voice channel names are short Title Case words. "type" is "text" or "voice".',
-  'Use at most 6 categories and 8 channels per category. Keep the layout practical and well organised:',
-  'info/rules first, then chat, then community, then voice. Respect the owner request and the server context.',
-  'Do not repeat categories or channels that already exist. Never use @everyone or @here.',
+  'Size: follow the number the owner asks for (default about 30 channels). Hard limits: 10 categories, 12 channels per category, 50 channels in total.',
+  'Layout, in this order and adapted to the request: START HERE / INFO (welcome, rules, announcements, faq, roles), COMMUNITY (general chat, media, memes, bot-commands, suggestions),',
+  'the theme sections that fit the request (for example gaming, study, music, trading, art), SUPPORT (help, tickets, report), VOICE LOUNGES (several voice rooms: general, gaming, music, chill, study, AFK),',
+  'EVENTS / GIVEAWAYS if it fits, and a STAFF category with "private": true and "allowedRoles" set to staff-like role names from the server context (staff-chat, mod-logs, admin, voice).',
+  'Only mark a category private when it is clearly for staff. Never make channels read-only and never restrict chatting in public channels.',
+  'Do not repeat categories or channels that already exist (see the server context). Never use @everyone or @here.',
 ].join('\n');
 
 /** Lowercase letters/digits only, so "📢 INFO" and "info" compare equal. */
@@ -177,6 +180,11 @@ export function sanitizePlan(raw, existing = { categories: new Map(), channels: 
     plan.categories.push({
       label: name,
       emoji,
+      private: rawCategory?.private === true,
+      allowedRoles: (Array.isArray(rawCategory?.allowedRoles) ? rawCategory.allowedRoles : [])
+        .map((r) => cleanWords(r, 60))
+        .filter(Boolean)
+        .slice(0, 8),
       existingId: existingCategory,
       channels: channels.map((c) => ({
         ...c,
@@ -218,14 +226,15 @@ function buildExisting(guild) {
 }
 
 /** Ask Gemini and return a sanitized plan. Throws an error with `userMessage` on failure. */
-export async function requestPlan(guild, request) {
-  const context = collectContext(guild);
+export async function requestPlan(guild, request, { fresh = false } = {}) {
+  // fresh = the server is about to be wiped, so plan as if it were empty.
+  const context = fresh ? { name: guild.name, memberCount: guild.memberCount, roles: collectContext(guild).roles, categories: [], uncategorized: [], totalChannels: 0 } : collectContext(guild);
   const text = await askGemini(buildPrompt(request.slice(0, LIMITS.maxRequestLength), context), {
     systemInstruction: SYSTEM_INSTRUCTION,
-    maxOutputTokens: 4096,
+    maxOutputTokens: 8192,
     json: true,
     maxQuestionLength: 6000,
-    totalTimeoutMs: 60000,
+    totalTimeoutMs: 90000,
   });
 
   let raw;
@@ -237,7 +246,7 @@ export async function requestPlan(guild, request) {
     throw error;
   }
 
-  const plan = sanitizePlan(raw, buildExisting(guild));
+  const plan = sanitizePlan(raw, fresh ? undefined : buildExisting(guild));
   if (!plan.categories.length) {
     const error = new Error('Empty plan');
     error.userMessage = plan.skipped.length
@@ -252,7 +261,7 @@ export async function requestPlan(guild, request) {
  * Creates the planned categories/channels one by one.
  * `onProgress(event)` is called after each step: { kind, label, status: 'ok'|'fail'|'skip', error? }
  */
-export async function applyPlan(guild, plan, onProgress = () => {}) {
+export async function applyPlan(guild, plan, onProgress = () => {}, { invokerId = null, botId = null } = {}) {
   const botMember = guild.members.me;
   const results = { created: 0, failed: 0, steps: [] };
 
@@ -265,12 +274,14 @@ export async function applyPlan(guild, plan, onProgress = () => {}) {
 
   for (const category of plan.categories) {
     let parentId = category.existingId;
+    const overwrites = category.private && !category.existingId ? privateOverwrites(guild, category, invokerId, botId) : null;
 
     if (!parentId) {
       try {
         const created = await guild.channels.create({
           name: category.name,
           type: ChannelType.GuildCategory,
+          ...(overwrites ? { permissionOverwrites: overwrites } : {}),
           reason: 'AI server setup (/aisetup)',
         });
         parentId = created.id;
@@ -291,6 +302,7 @@ export async function applyPlan(guild, plan, onProgress = () => {}) {
           name: channel.name,
           type: channel.type === 'voice' ? ChannelType.GuildVoice : ChannelType.GuildText,
           parent: parentId,
+          ...(overwrites ? { permissionOverwrites: overwrites } : {}),
           ...(channel.topic ? { topic: channel.topic } : {}),
           reason: 'AI server setup (/aisetup)',
         });
@@ -307,4 +319,44 @@ export async function applyPlan(guild, plan, onProgress = () => {}) {
 
 export function botCanManageChannels(guild) {
   return Boolean(guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels));
+}
+
+// Staff-only categories: hidden from @everyone, visible to the named roles, the requester and the bot.
+// (Hiding is not locking: nothing is made read-only.)
+function privateOverwrites(guild, category, invokerId, botId) {
+  const see = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.Connect];
+  const roleIds = (category.allowedRoles ?? [])
+    .map((wanted) => {
+      const key = normalizeName(wanted);
+      return [...guild.roles.cache.values()].find((r) => r.id !== guild.id && !r.managed && normalizeName(r.name) === key)?.id;
+    })
+    .filter(Boolean);
+  return [
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+    ...(invokerId ? [{ id: invokerId, allow: see }] : []),
+    ...(botId ? [{ id: botId, allow: [...see, PermissionFlagsBits.ManageChannels] }] : []),
+    ...roleIds.map((id) => ({ id, allow: see })),
+  ];
+}
+
+/** Text tree of a plan; statusByName marks progress (✅ ❌ ⏭️ ⏳). */
+export function renderPlan(plan, statusByName = new Map(), maxLength = 3800) {
+  const icon = (name) => {
+    const status = statusByName.get(name);
+    if (status === 'ok') return '✅';
+    if (status === 'fail') return '❌';
+    if (status === 'skip') return '⏭️';
+    if (status === 'run') return '⏳';
+    return '▫️';
+  };
+  const lines = [];
+  for (const category of plan.categories) {
+    lines.push(`${icon(category.name)} **${category.name}**${category.existingId ? ' *(existing)*' : ''}${category.private ? ' 🔒' : ''}`);
+    for (const channel of category.channels) {
+      const kind = channel.type === 'voice' ? '🔊' : '#️⃣';
+      lines.push(`　${icon(channel.name)} ${kind} ${channel.name}`);
+    }
+  }
+  const text = lines.join('\n');
+  return text.length > maxLength ? `${text.slice(0, maxLength - 20)}\n…` : text;
 }
