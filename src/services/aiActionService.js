@@ -32,7 +32,7 @@ const SAFE_MENTIONS = { parse: [], repliedUser: false };
 const COLORS = { info: 0x5865f2, ok: 0x57f287, warn: 0xfee75c, error: 0xed4245 };
 
 // Cheap local check so ordinary questions keep their fast path (no extra AI call).
-const ACTION_WORDS = /\b(kick|ban|timeout|mute|unmute|purge|delete|rename|assign|role|roles|channel|channels|category|categories|voice|forum|stage|announcement|announcements|private|community|banao|bana|nikalo|nikal|hatao|send|bhej|bhejo|bhejna|post|announce|msg|paste|edit|likh|likho|daal|dal)\b/i;
+const ACTION_WORDS = /\b(kick|ban|timeout|mute|unmute|purge|delete|rename|assign|role|roles|channel|channels|category|categories|voice|forum|stage|announcement|announcements|private|community|banao|bana|nikalo|nikal|hatao|send|bhej|bhejo|bhejna|post|announce|msg|paste|edit|likh|likho|daal|dal|audit|report|nickname|nick|move|event|events|topic|color|colour|humans|bots|disconnect|tournament|members)\b/i;
 export function looksLikeActionRequest(text) {
   return ACTION_WORDS.test(String(text ?? ''));
 }
@@ -47,6 +47,8 @@ function buildSystemInstruction() {
     '"private" = only the listed roles, the requester and the bot can see it. "community" or normal = public.',
     'If the staff member says "this / ise / isko / ye" without giving text, they mean "repliedMessage" in the context: use its text (polish it) as the content.',
     'To delete everything and rebuild, return delete_all_channels first and then create_layout. For a full server layout or 10+ channels use create_layout, not many create_channel actions.',
+    `For events: the current time is given as "nowIso"; the staff member is in UTC offset "${process.env.BOT_UTC_OFFSET || '+05:30'}" unless they say otherwise. Prefer startsInMinutes for relative times.`,
+    'Use audit_server for "find problems / improve security" and server_report for statistics. Prefer bulk_role for "give everyone / all humans / all bots a role".',
     'Pick fitting emojis yourself. You can never lock channels, change permissions or give admin rights.',
     `If the message is just a question or you cannot do it, return an empty actions list and put a short helpful answer (under 400 characters) in "reply". At most ${ACTION_LIMITS.maxActions} actions.`,
     'Reply in the same language as the staff member (Hinglish is fine).',
@@ -90,7 +92,7 @@ export function sanitizeActions(raw, ctx) {
 export function checkPermissions(action, invoker, botMember) {
   const [flag, label] = ACTION_TYPES[action.type].permission;
   if (!invoker?.permissions?.has(flag)) return `you need the **${label}** permission`;
-  if (!botMember?.permissions?.has(flag)) return `I need the **${label}** permission`;
+  if (ACTION_TYPES[action.type].botPermission !== false && !botMember?.permissions?.has(flag)) return `I need the **${label}** permission`;
   return null;
 }
 
@@ -128,7 +130,8 @@ export async function planActions(message, text, replied = null) {
     channels: [...guild.channels.cache.values()]
       .filter((c) => c.type !== ChannelType.GuildCategory && !c.isThread?.())
       .slice(0, 60)
-      .map((c) => ({ id: c.id, name: c.name })),
+      .map((c) => ({ id: c.id, name: c.name, type: [ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(c.type) ? 'voice' : 'text' })),
+    nowIso: new Date().toISOString(),
     mentionedChannels: [...(message.mentions.channels?.values?.() ?? [])].map((c) => ({ id: c.id, name: c.name })),
     currentChannel: { id: message.channel.id, name: message.channel.name },
     repliedMessage: replied ? { author: replied.author, text: replied.text } : null,
