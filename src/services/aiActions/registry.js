@@ -35,6 +35,7 @@ import {
   invokerOutranks,
   isPowerfulRole,
 } from './helpers.js';
+import { MANAGE_ACTIONS } from './manageActions.js';
 
 const KINDS = new Set(['text', 'voice', 'announcement', 'forum', 'stage']);
 const TYPE_BY_KIND = {
@@ -64,7 +65,7 @@ async function fetchMember(env, userId) {
   return member;
 }
 
-export const ACTION_TYPES = {
+const CORE_ACTIONS = {
   kick: {
     permission: [PermissionFlagsBits.KickMembers, 'Kick Members'],
     risky: true,
@@ -538,3 +539,5 @@ function resolveSendTarget(a, env) {
   }
   return found;
 }
+
+export const ACTION_TYPES = { ...CORE_ACTIONS, ...MANAGE_ACTIONS };
