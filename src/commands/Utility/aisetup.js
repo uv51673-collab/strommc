@@ -10,7 +10,7 @@ import {
 import { logger } from '../../utils/logger.js';
 import { checkRateLimit } from '../../utils/rateLimiter.js';
 import { isGeminiConfigured } from '../../services/geminiService.js';
-import { requestPlan, applyPlan, botCanManageChannels } from '../../services/aiServerSetupService.js';
+import { requestPlan, applyPlan, botCanManageChannels, renderPlan } from '../../services/aiServerSetupService.js';
 
 // Plain EmbedBuilder data is used on purpose: the shared createEmbed() helper strips emojis,
 // and the whole point of this command is showing the emojis the AI picked.
@@ -27,27 +27,6 @@ const embed = (color, title, description, footer) =>
     description: String(description).slice(0, 4000),
     ...(footer ? { footer: { text: footer } } : {}),
   });
-
-function renderPlan(plan, statusByName = new Map()) {
-  const icon = (name) => {
-    const status = statusByName.get(name);
-    if (status === 'ok') return '✅';
-    if (status === 'fail') return '❌';
-    if (status === 'skip') return '⏭️';
-    if (status === 'run') return '⏳';
-    return '▫️';
-  };
-  const lines = [];
-  for (const category of plan.categories) {
-    lines.push(`${icon(category.name)} **${category.name}**${category.existingId ? ' *(existing)*' : ''}`);
-    for (const channel of category.channels) {
-      const kind = channel.type === 'voice' ? '🔊' : '#️⃣';
-      lines.push(`　${icon(channel.name)} ${kind} ${channel.name}`);
-    }
-  }
-  const text = lines.join('\n');
-  return text.length > 3800 ? `${text.slice(0, 3780)}\n…` : text;
-}
 
 function buttons(disabled = false) {
   return [
@@ -199,7 +178,7 @@ export default {
         const next = firstPending();
         if (next) statusByName.set(next, 'run');
         await pushProgress(totals);
-      });
+      }, { invokerId: interaction.user.id, botId: interaction.client.user.id });
 
       if (pendingEdit) await pendingEdit;
       const failures = results.steps.filter((s) => s.status === 'fail');

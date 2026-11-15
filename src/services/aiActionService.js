@@ -26,7 +26,7 @@ import { cleanText } from './aiActions/helpers.js';
 import { normalizeName } from './aiServerSetupService.js';
 import { logger } from '../utils/logger.js';
 
-export const ACTION_LIMITS = { maxActions: 10, maxModeration: 5, confirmMs: 60000 };
+export const ACTION_LIMITS = { maxActions: 10, maxModeration: 5, confirmMs: 120000 };
 
 const SAFE_MENTIONS = { parse: [], repliedUser: false };
 const COLORS = { info: 0x5865f2, ok: 0x57f287, warn: 0xfee75c, error: 0xed4245 };
@@ -45,6 +45,8 @@ function buildSystemInstruction() {
     ...Object.values(ACTION_TYPES).map((entry) => `- ${entry.prompt}`),
     'Rules: only use user IDs from "mentionedUsers". Never invent users. Channels may be referenced by id or name from "channels".',
     '"private" = only the listed roles, the requester and the bot can see it. "community" or normal = public.',
+    'If the staff member says "this / ise / isko / ye" without giving text, they mean "repliedMessage" in the context: use its text (polish it) as the content.',
+    'To delete everything and rebuild, return delete_all_channels first and then create_layout. For a full server layout or 10+ channels use create_layout, not many create_channel actions.',
     'Pick fitting emojis yourself. You can never lock channels, change permissions or give admin rights.',
     `If the message is just a question or you cannot do it, return an empty actions list and put a short helpful answer (under 400 characters) in "reply". At most ${ACTION_LIMITS.maxActions} actions.`,
     'Reply in the same language as the staff member (Hinglish is fine).',
@@ -113,7 +115,7 @@ const embed = (color, title, description) =>
   new EmbedBuilder({ color: COLORS[color], title, description: String(description).slice(0, 4000) });
 
 /** Ask Gemini what the staff member wants. Throws an error with `userMessage` on failure. */
-export async function planActions(message, text) {
+export async function planActions(message, text, replied = null) {
   const { guild } = message;
   const mentionedUsers = [...message.mentions.users.values()]
     .filter((u) => u.id !== message.client.user.id)
@@ -129,6 +131,7 @@ export async function planActions(message, text) {
       .map((c) => ({ id: c.id, name: c.name })),
     mentionedChannels: [...(message.mentions.channels?.values?.() ?? [])].map((c) => ({ id: c.id, name: c.name })),
     currentChannel: { id: message.channel.id, name: message.channel.name },
+    repliedMessage: replied ? { author: replied.author, text: replied.text } : null,
   };
 
   const answer = await askGemini(`Staff message: ${text}\n\nContext (JSON): ${JSON.stringify(context)}`, {
@@ -149,7 +152,7 @@ export async function planActions(message, text) {
 }
 
 /** Entry point from botMentionService. Runs in the background. */
-export async function handleActionRequest(message, text) {
+export async function handleActionRequest(message, text, { replied = null } = {}) {
   const { guild, client } = message;
   const typing = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
   const reaction = await message.react('⏳').catch(() => null);
@@ -169,7 +172,7 @@ export async function handleActionRequest(message, text) {
 
     let plan;
     try {
-      plan = await planActions(message, text);
+      plan = await planActions(message, text, replied);
     } catch (error) {
       clear();
       if (!error?.userMessage) logger.error('ai action: planning failed', error);
@@ -187,6 +190,9 @@ export async function handleActionRequest(message, text) {
     const plannedRoles = new Set(actions.filter((a) => a.type === 'create_role').map((a) => normalizeName(a.name)));
     const env = { message, guild, invoker, client, categoriesMade: new Map(), protectedIds: new Set([message.id]), plannedRoles };
 
+    // delete_all_channels first, create_layout last (see `order` in the registry).
+    actions.sort((a, b) => (ACTION_TYPES[a.type].order ?? 1) - (ACTION_TYPES[b.type].order ?? 1));
+
     const allowed = [];
     for (const action of actions) {
       const entry = ACTION_TYPES[action.type];
@@ -195,7 +201,10 @@ export async function handleActionRequest(message, text) {
         ? `${label(action)}: ${permissionProblem}`
         : ((await entry.validate?.(action, env)) ?? null);
       if (problem) refused.push(problem);
-      else allowed.push(action);
+      else {
+        allowed.push(action);
+        if (action.type === 'delete_all_channels' && action.scope === 'all') env.plannedWipe = true;
+      }
     }
 
     clear();
@@ -210,6 +219,13 @@ export async function handleActionRequest(message, text) {
 
     const planText = allowed.map(describe).join('\n');
     let target = null; // message that will show the result
+    let lastProgressAt = 0;
+    env.progress = (progressText) => {
+      const now = Date.now();
+      if (!target || now - lastProgressAt < 1500) return;
+      lastProgressAt = now;
+      target.edit({ embeds: [embed('info', '⚙️ Working…', progressText)], components: [] }).catch(() => {});
+    };
 
     if (allowed.some(isRisky)) {
       const buttons = (disabled) => [
@@ -219,7 +235,11 @@ export async function handleActionRequest(message, text) {
         ),
       ];
       target = await send({
-        embeds: [embed('warn', '⚠️ Confirm these actions', `${planText}${skipped}\n\nOnly you can confirm. Expires in 60 seconds.`)],
+        embeds: [embed(
+          'warn',
+          allowed.some((a) => ACTION_TYPES[a.type].destructive) ? '⚠️ Confirm — this cannot be undone' : '⚠️ Confirm these actions',
+          `${planText}${skipped}\n\nOnly you can confirm. Expires in 2 minutes.`,
+        )],
         components: buttons(false),
       });
       if (!target) return;
@@ -244,7 +264,7 @@ export async function handleActionRequest(message, text) {
         await click.update({ embeds: [embed('warn', 'Cancelled', 'Nothing was done.')], components: [] }).catch(() => {});
         return;
       }
-      await click.update({ embeds: [embed('info', '⚙️ Working…', planText)], components: [] }).catch(() => {});
+      await click.update({ embeds: [embed('info', '⚙️ Working…', 'Starting…')], components: [] }).catch(() => {});
     }
 
     const lines = [];

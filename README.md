@@ -159,6 +159,9 @@ Staff can also give orders in plain words, e.g. `@Bot kick @user spamming`, `@Bo
 - kick/ban targets must be users mentioned in the message, and both the staff member and the bot need the real Discord permission (Kick Members / Ban Members / Manage Channels). Normal role-hierarchy checks apply and cases are logged.
 - Also supported: `timeout`/`untimeout`, `purge` (delete recent messages), create/delete/give/remove roles, rename/delete channels. Roles are created with no permissions, and a role with powerful permissions can only be handed out by an Administrator. There is no lock, slowmode or permission-editing action.
 - `send_message`: ask the bot to post a text or embed in any channel (`@Bot ise #rewards me bhej do ...`). Gemini tidies the wording and layout first. Staff and the bot both need access to the target channel; @everyone/@here and pings are always disabled.
+- `create_layout`: one order builds a full professional server (up to 50 items, emojis, voice lounges, optional private staff category) with a single Confirm and a live progress embed.
+- `delete_all_channels`: deletes every channel (or one category) after one Confirm. Administrator/owner only for "all"; the current channel and Community-required channels are always kept. "Delete everything and rebuild" in one message deletes first, then builds.
+- If staff reply to a message and ping the bot, the bot reads that message (text and embeds) as context.
 - Risky actions (kick, ban, purge, deleting channels or roles) make the whole batch wait for Confirm; every batch ends with a result embed.
 - Channel kinds: text, voice, announcement, forum, stage; `private` hides it from @everyone and shows it to the named roles, the requester and the bot. Announcement/forum fall back to text if Community is not enabled.
 
@@ -166,7 +169,7 @@ Staff can also give orders in plain words, e.g. `@Bot kick @user spamming`, `@Bo
 
 `/aisetup request:<what your server is about>` lets Gemini design categories plus text and voice channels, picking the emojis itself. The bot shows a preview, and nothing is created until you press **Create everything**. Creation then runs with a live progress embed (created / failed / skipped) and a final summary.
 
-Needs **Manage Channels** for both you and the bot, and `GEMINI_API_KEY`. Existing categories and channels are never duplicated or deleted. Limits per run: 6 categories, 8 channels each, 30 items total.
+Needs **Manage Channels** for both you and the bot, and `GEMINI_API_KEY`. Existing categories and channels are never duplicated or deleted. Limits per run: 10 categories, 12 channels each, 50 items total. Staff categories can be private (hidden, never read-only).
 
 ### Using GitHub Container Registry
 

@@ -18,6 +18,7 @@ import {
   splitForDiscord,
 } from './geminiService.js';
 import { handleActionRequest, looksLikeActionRequest } from './aiActionService.js';
+import { getRepliedMessage, withRepliedMessage } from './repliedMessageService.js';
 
 const AI_RATE_LIMIT_ATTEMPTS = 5;
 const AI_RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -81,7 +82,7 @@ async function answerQuestion(message, question) {
   try {
     await keepTyping();
 
-    const answer = await askGemini(question);
+    const answer = await askGemini(question, { maxQuestionLength: 4000 });
     clearInterval(typingTimer);
     clearWaiting();
     const chunks = splitForDiscord(answer).slice(0, MAX_REPLY_CHUNKS);
@@ -172,12 +173,15 @@ export async function handleBotMention(message, client) {
 
   // Orders like "kick @user" or "make a private channel" go to the action handler;
   // plain questions keep the fast answer path. Both run in the background.
+  // If the staff member replied to a message, the AI gets to read that message too.
+  const replied = await getRepliedMessage(message);
+
   if (looksLikeActionRequest(question)) {
-    void handleActionRequest(message, question);
+    void handleActionRequest(message, question, { replied });
     return true;
   }
 
   // Fire and forget: the channel stays free while Gemini is thinking.
-  void answerQuestion(message, question);
+  void answerQuestion(message, withRepliedMessage(question, replied));
   return true;
 }

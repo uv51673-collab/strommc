@@ -20,6 +20,7 @@ import {
   composeTextName,
   composeVoiceName,
 } from '../aiServerSetupService.js';
+import { requestPlan, applyPlan, renderPlan } from '../aiServerSetupService.js';
 import {
   cleanText,
   cleanMessage,
@@ -334,6 +335,108 @@ export const ACTION_TYPES = {
       const name = channel.name;
       await channel.delete(`AI action requested by ${env.invoker.user.tag}`);
       return `Deleted ${name}`;
+    },
+  },
+
+  delete_all_channels: {
+    permission: [PermissionFlagsBits.ManageChannels, 'Manage Channels'],
+    risky: true,
+    destructive: true,
+    order: 0, // always runs first, so a fresh layout can be built afterwards
+    prompt: '{"type":"delete_all_channels","scope":"all or a category name"}  (deletes every channel, or one category with its channels; the current channel and Community-required channels are always kept)',
+    sanitize(item) {
+      const scope = cleanText(item?.scope, 60);
+      return {
+        type: 'delete_all_channels',
+        scope: !scope || /^(all|everything|sab|saare|sabhi)$/i.test(scope) ? 'all' : scope,
+        ids: [],
+        names: [],
+      };
+    },
+    describe(a) {
+      const shown = a.names.slice(0, 25).join(', ');
+      const more = a.names.length > 25 ? ` … +${a.names.length - 25} more` : '';
+      const what = a.scope === 'all' ? 'EVERY channel (except this one and Community-required ones)' : `category "${a.scope}"`;
+      return `🗑️ **Delete ${a.ids.length} channel(s)** — ${what}:\n${shown}${more}`;
+    },
+    async validate(a, env) {
+      const { guild, invoker, message } = env;
+      const all = [...guild.channels.cache.values()].filter((c) => !c.isThread?.());
+      let pool;
+      if (a.scope === 'all') {
+        const isAdmin = invoker.permissions.has(PermissionFlagsBits.Administrator) || guild.ownerId === invoker.id;
+        if (!isAdmin) return 'delete all channels: only an Administrator or the server owner can wipe every channel';
+        pool = all;
+      } else {
+        const key = normalizeName(a.scope);
+        const category = all.find((c) => c.type === ChannelType.GuildCategory && normalizeName(c.name) === key);
+        if (!category) return `delete channels: no category called "${a.scope}"`;
+        pool = [category, ...all.filter((c) => c.parentId === category.id)];
+      }
+      const keep = new Set([message.channel.id, guild.rulesChannelId, guild.publicUpdatesChannelId].filter(Boolean));
+      const doomed = pool.filter(
+        (c) => !keep.has(c.id) && c.deletable && c.permissionsFor?.(invoker)?.has(PermissionFlagsBits.ViewChannel),
+      );
+      if (!doomed.length) return 'delete channels: there is nothing to delete';
+      a.ids = doomed.map((c) => c.id);
+      a.names = doomed.map((c) => c.name);
+      return null;
+    },
+    async run(a, env) {
+      const { guild } = env;
+      const isCategory = (c) => c.type === ChannelType.GuildCategory;
+      // Channels first, categories last (so empty categories can go too).
+      const ordered = a.ids
+        .map((id) => guild.channels.cache.get(id))
+        .filter(Boolean)
+        .sort((x, y) => Number(isCategory(x)) - Number(isCategory(y)));
+      let done = 0;
+      let keptCategories = 0;
+      const failed = [];
+      for (const [index, channel] of ordered.entries()) {
+        if (isCategory(channel) && [...guild.channels.cache.values()].some((c) => c.parentId === channel.id)) {
+          keptCategories++;
+          continue;
+        }
+        try {
+          await channel.delete(`AI action requested by ${env.invoker.user.tag}`);
+          done++;
+        } catch {
+          failed.push(channel.name);
+        }
+        env.progress?.(`🗑️ Deleting channels… ${index + 1}/${ordered.length}`);
+      }
+      return `Deleted ${done} of ${ordered.length} channel(s)${failed.length ? `; could not delete: ${failed.slice(0, 5).join(', ')}` : ''}${keptCategories ? `; kept ${keptCategories} categor${keptCategories === 1 ? 'y' : 'ies'} that still contain channels` : ''}`;
+    },
+  },
+
+  create_layout: {
+    permission: [PermissionFlagsBits.ManageChannels, 'Manage Channels'],
+    risky: true,
+    order: 2, // after a wipe
+    prompt: '{"type":"create_layout","request":"what to build, e.g. professional gaming server with 40 channels"}  (use this for a FULL server layout or more than about 10 channels: up to 50 items with emojis, categories, voice rooms and a private staff category; for a few channels use create_channel)',
+    sanitize(item) {
+      const request = cleanText(item?.request, 400);
+      return request ? { type: 'create_layout', request, plan: null } : 'layout: tell me what kind of server to build';
+    },
+    describe: (a) => `🏗️ **Build ${a.plan.total} items** (${a.plan.categories.length} categories):\n${renderPlan(a.plan, new Map(), 2200)}`,
+    async validate(a, env) {
+      try {
+        a.plan = await requestPlan(env.guild, a.request, { fresh: Boolean(env.plannedWipe) });
+        return null;
+      } catch (error) {
+        return `layout: ${error?.userMessage || 'I could not plan that layout'}`;
+      }
+    },
+    async run(a, env) {
+      const results = await applyPlan(
+        env.guild,
+        a.plan,
+        (step, totals) => env.progress?.(`🏗️ Building your server… ${totals.created + totals.failed}/${a.plan.total}`),
+        { invokerId: env.invoker.id, botId: env.client.user.id },
+      );
+      const failures = results.steps.filter((step) => step.status === 'fail');
+      return `Created ${results.created} of ${a.plan.total} items${failures.length ? ` (${failures.length} failed: ${failures.slice(0, 3).map((f) => f.label).join(', ')})` : ''}`;
     },
   },
 
