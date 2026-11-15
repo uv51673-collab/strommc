@@ -100,3 +100,25 @@ export function invokerOutranks(invoker, role) {
   if (invoker.guild?.ownerId === invoker.id) return true;
   return (invoker.roles?.highest?.position ?? -1) > role.position;
 }
+
+/**
+ * Cleaning for text the bot will post: keeps line breaks, markdown and <@id>/<#id> mentions,
+ * but defuses @everyone/@here and caps the length.
+ */
+export function cleanMessage(value, max) {
+  return String(value ?? '')
+    .replace(/\r/g, '')
+    .replace(/@(everyone|here)/gi, '@\u200b$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, max);
+}
+
+/** Can this member see and write in the channel? Returns null when fine, else a reason. */
+export function cannotWriteIn(channel, member, who) {
+  const perms = channel.permissionsFor?.(member);
+  if (!perms?.has(PermissionFlagsBits.ViewChannel) || !perms?.has(PermissionFlagsBits.SendMessages)) {
+    return `${who} cannot send messages in #${channel.name}`;
+  }
+  return null;
+}
