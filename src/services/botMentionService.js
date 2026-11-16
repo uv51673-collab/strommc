@@ -19,6 +19,7 @@ import {
 } from './geminiService.js';
 import { handleActionRequest, looksLikeActionRequest } from './aiActionService.js';
 import { getRepliedMessage, withRepliedMessage } from './repliedMessageService.js';
+import { loadMemory, formatMemory, recordTurn } from './aiMemoryService.js';
 
 const AI_RATE_LIMIT_ATTEMPTS = 5;
 const AI_RATE_LIMIT_WINDOW_MS = 60 * 1000;
@@ -68,7 +69,14 @@ const SAFE_MENTIONS = { parse: [], repliedUser: false };
 
 const TYPING_REFRESH_MS = 8000; // Discord's typing indicator lasts ~10s
 
-async function answerQuestion(message, question) {
+function remember(message, question, answer) {
+  const { client, guild, channel, author } = message;
+  void recordTurn(client, guild.id, channel.id, 'user', question, author?.tag).then(() =>
+    recordTurn(client, guild.id, channel.id, 'bot', answer),
+  );
+}
+
+async function answerQuestion(message, question, rawQuestion = question) {
   // Keep the "typing..." indicator alive while Gemini (and any retries) take their time.
   const keepTyping = () => message.channel.sendTyping().catch(() => {});
   const typingTimer = setInterval(keepTyping, TYPING_REFRESH_MS);
@@ -82,7 +90,11 @@ async function answerQuestion(message, question) {
   try {
     await keepTyping();
 
-    const answer = await askGemini(question, { maxQuestionLength: 4000 });
+    // The AI also sees the server notes and the recent conversation (including its own replies).
+    const memoryBlock = formatMemory(await loadMemory(message.client, message.guild.id, message.channel.id));
+    const prompt = memoryBlock ? `${memoryBlock}\n\nStaff message (answer this one):\n${question}` : question;
+    const answer = await askGemini(prompt, { maxQuestionLength: 9000 });
+    remember(message, rawQuestion, answer);
     clearInterval(typingTimer);
     clearWaiting();
     const chunks = splitForDiscord(answer).slice(0, MAX_REPLY_CHUNKS);
@@ -182,6 +194,6 @@ export async function handleBotMention(message, client) {
   }
 
   // Fire and forget: the channel stays free while Gemini is thinking.
-  void answerQuestion(message, withRepliedMessage(question, replied));
+  void answerQuestion(message, withRepliedMessage(question, replied), question);
   return true;
 }

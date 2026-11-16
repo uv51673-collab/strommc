@@ -25,14 +25,15 @@ import { ACTION_TYPES } from './aiActions/registry.js';
 import { cleanText } from './aiActions/helpers.js';
 import { normalizeName } from './aiServerSetupService.js';
 import { logger } from '../utils/logger.js';
+import { loadMemory, recordTurn } from './aiMemoryService.js';
 
-export const ACTION_LIMITS = { maxActions: 10, maxModeration: 5, confirmMs: 120000 };
+export const ACTION_LIMITS = { maxActions: 25, maxModeration: 5, confirmMs: 120000 };
 
 const SAFE_MENTIONS = { parse: [], repliedUser: false };
 const COLORS = { info: 0x5865f2, ok: 0x57f287, warn: 0xfee75c, error: 0xed4245 };
 
 // Cheap local check so ordinary questions keep their fast path (no extra AI call).
-const ACTION_WORDS = /\b(kick|ban|timeout|mute|unmute|purge|delete|rename|assign|role|roles|channel|channels|category|categories|voice|forum|stage|announcement|announcements|private|community|banao|bana|nikalo|nikal|hatao|send|bhej|bhejo|bhejna|post|announce|msg|paste|edit|likh|likho|daal|dal|audit|report|nickname|nick|move|event|events|topic|color|colour|humans|bots|disconnect|tournament|members|welcome|goodbye|verification|verify|ticket|tickets|giveaway|logging|logs|setup|autorole|panel|log)\b/i;
+const ACTION_WORDS = /\b(kick|ban|timeout|mute|unmute|purge|delete|rename|assign|role|roles|channel|channels|category|categories|voice|forum|stage|announcement|announcements|private|community|banao|bana|nikalo|nikal|hatao|remember|yaad|bhool|bhul|forget|memory|note|notes|send|bhej|bhejo|bhejna|post|announce|msg|paste|edit|likh|likho|daal|dal|audit|report|nickname|nick|move|event|events|topic|color|colour|humans|bots|disconnect|tournament|members|welcome|goodbye|verification|verify|ticket|tickets|giveaway|logging|logs|setup|autorole|panel|log)\b/i;
 export function looksLikeActionRequest(text) {
   return ACTION_WORDS.test(String(text ?? ''));
 }
@@ -52,6 +53,8 @@ function buildSystemInstruction(client) {
     'Use audit_server for "find problems / improve security" and server_report for statistics. Prefer bulk_role for "give everyone / all humans / all bots a role".',
     'Pick fitting emojis yourself. You can never lock channels, change permissions or give admin rights.',
     `If the message is just a question or you cannot do it, return an empty actions list and put a short helpful answer (under 400 characters) in "reply". At most ${ACTION_LIMITS.maxActions} actions.`,
+    'Context also has "serverNotes" (things staff asked you to remember: follow them, e.g. naming style or language) and "recentConversation" (earlier messages in this channel; lines from "bot" are your own earlier replies). Follow-ups such as "ab isko bhi" or "wahi dubara" refer to it.',
+    'Never refuse a task because it is big: split it into actions (up to the limit) and do as much as is allowed. Only skip what the rules forbid (locking chat, admin rights, permissions editing) and say so.',
     'Reply in the same language as the staff member (Hinglish is fine).',
   ].join('\n');
 }
@@ -141,12 +144,16 @@ export async function planActions(message, text, replied = null) {
     repliedMessage: replied ? { author: replied.author, text: replied.text } : null,
   };
 
+  const memory = await loadMemory(message.client, guild.id, message.channel.id);
+  context.serverNotes = memory.notes.map((n) => `#${n.id} ${n.text}`);
+  context.recentConversation = memory.turns.map((t) => ({ from: t.role === 'bot' ? 'bot' : t.who || 'staff', text: t.text }));
+
   const answer = await askGemini(`Staff message: ${text}\n\nContext (JSON): ${JSON.stringify(context)}`, {
     systemInstruction: buildSystemInstruction(message.client),
-    maxOutputTokens: 2048,
+    maxOutputTokens: 4096,
     json: true,
-    maxQuestionLength: 6000,
-    totalTimeoutMs: 30000,
+    maxQuestionLength: 12000,
+    totalTimeoutMs: 45000,
   });
 
   try {
@@ -158,8 +165,21 @@ export async function planActions(message, text, replied = null) {
   }
 }
 
-/** Entry point from botMentionService. Runs in the background. */
-export async function handleActionRequest(message, text, { replied = null } = {}) {
+/** Entry point from botMentionService. Runs in the background; remembers the exchange afterwards. */
+export async function handleActionRequest(message, text, options = {}) {
+  const track = { summary: '' };
+  try {
+    await runActionRequest(message, text, options, track);
+  } finally {
+    const { guild, client, channel, author } = message;
+    if (guild && channel) {
+      await recordTurn(client, guild.id, channel.id, 'user', text, author?.tag);
+      await recordTurn(client, guild.id, channel.id, 'bot', track.summary || '(no reply)');
+    }
+  }
+}
+
+async function runActionRequest(message, text, { replied = null } = {}, track = { summary: '' }) {
   const { guild, client } = message;
   const typing = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
   const reaction = await message.react('⏳').catch(() => null);
@@ -167,10 +187,14 @@ export async function handleActionRequest(message, text, { replied = null } = {}
     clearInterval(typing);
     reaction?.users?.remove(client.user.id).catch(() => {});
   };
-  const send = (payload) => message.reply({ ...payload, allowedMentions: SAFE_MENTIONS }).catch((e) => {
-    logger.warn(`ai action: reply failed: ${e?.message}`);
-    return null;
-  });
+  const send = (payload) => {
+    // What the bot said is remembered, but the confirm prompt itself is not a result.
+    if (!payload.components) track.summary = payload.content ?? payload.embeds?.[0]?.data?.description ?? track.summary;
+    return message.reply({ ...payload, allowedMentions: SAFE_MENTIONS }).catch((e) => {
+      logger.warn(`ai action: reply failed: ${e?.message}`);
+      return null;
+    });
+  };
 
   try {
     message.channel.sendTyping().catch(() => {});
@@ -264,10 +288,12 @@ export async function handleActionRequest(message, text, { replied = null } = {}
           },
         });
       } catch {
+        track.summary = 'Confirmation timed out; nothing was done.';
         await target.edit({ embeds: [embed('warn', 'Timed out', 'Nothing was done.')], components: [] }).catch(() => {});
         return;
       }
       if (click.customId === 'aiact_cancel') {
+        track.summary = 'Cancelled by the staff member; nothing was done.';
         await click.update({ embeds: [embed('warn', 'Cancelled', 'Nothing was done.')], components: [] }).catch(() => {});
         return;
       }
@@ -287,6 +313,7 @@ export async function handleActionRequest(message, text, { replied = null } = {}
     }
     if (refused.length) lines.push(skipped.trim());
 
+    track.summary = lines.join(' | ');
     const finalEmbed = embed(failed ? 'warn' : 'ok', failed ? 'Done, with problems' : '✅ Done', lines.join('\n'));
     if (target) await target.edit({ embeds: [finalEmbed], components: [] }).catch(() => send({ embeds: [finalEmbed] }));
     else await send({ embeds: [finalEmbed] });
