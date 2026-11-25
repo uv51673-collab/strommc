@@ -2,14 +2,16 @@
  * Shared helpers for detecting bot-posted panel messages (tickets, verification, etc.)
  */
 
-export function messageHasButtonCustomId(message, buttonCustomId) {
+export function messageHasButtonCustomId(message, buttonCustomId, { prefix = false } = {}) {
     if (!message?.components?.length || !buttonCustomId) return false;
 
     const walk = (components) => {
         for (const component of components) {
             const json = typeof component.toJSON === 'function' ? component.toJSON() : component;
             if (!json) continue;
-            if (json.type === 2 && json.custom_id === buttonCustomId) return true;
+            if (json.type === 2 && (prefix
+                ? (json.custom_id === buttonCustomId || json.custom_id?.startsWith(`${buttonCustomId}:`))
+                : json.custom_id === buttonCustomId)) return true;
             if (Array.isArray(json.components) && walk(json.components)) return true;
         }
         return false;
@@ -36,10 +38,19 @@ export function messageHasSelectMenuCustomId(message, selectCustomId) {
     return walk(rows);
 }
 
-export function messageHasPanelMarker(message, { buttonCustomId, selectCustomId } = {}) {
-    if (buttonCustomId && messageHasButtonCustomId(message, buttonCustomId)) return true;
+export function messageHasPanelMarker(message, { buttonCustomId, selectCustomId, buttonPrefix = false } = {}) {
+    if (buttonCustomId && messageHasButtonCustomId(message, buttonCustomId, { prefix: buttonPrefix })) return true;
     if (selectCustomId && messageHasSelectMenuCustomId(message, selectCustomId)) return true;
     return false;
+}
+
+/** True for a ticket panel message: legacy single button, per-type buttons, or the dropdown. */
+export function messageHasTicketPanel(message) {
+    return messageHasPanelMarker(message, {
+        buttonCustomId: 'create_ticket',
+        buttonPrefix: true,
+        selectCustomId: 'ticket_panel_select',
+    });
 }
 
 export function formatPanelStatusField(panelStatus, { repostHint = 'Repost Panel' } = {}) {
@@ -71,6 +82,7 @@ export async function getBotPanelStatus(client, guild, {
     messageId = null,
     buttonCustomId = null,
     selectCustomId = null,
+    buttonPrefix = false,
     scanLimit = 50,
 } = {}) {
     if (!channelId) {
@@ -86,7 +98,7 @@ export async function getBotPanelStatus(client, guild, {
         return { exists: false, reason: 'channel_missing' };
     }
 
-    const marker = { buttonCustomId, selectCustomId };
+    const marker = { buttonCustomId, selectCustomId, buttonPrefix };
 
     if (messageId) {
         const message = await channel.messages.fetch(messageId).catch(() => null);
@@ -115,6 +127,8 @@ export async function getTicketPanelStatus(client, guild, config) {
         channelId: config.ticketPanelChannelId,
         messageId: config.ticketPanelMessageId,
         buttonCustomId: 'create_ticket',
+        buttonPrefix: true,
+        selectCustomId: 'ticket_panel_select',
     });
 }
 

@@ -17,6 +17,8 @@ import { logTicketEvent } from '../utils/ticket/ticketLogging.js';
 import { createError, ErrorTypes } from '../utils/errorHandler.js';
 import { ensureTypedServiceError, wrapServiceBoundary } from '../utils/serviceErrorBoundary.js';
 import { PRIORITY_MAP } from '../utils/helpers.js';
+import { resolveOpenCategory, slugify } from '../utils/ticket/ticketPanel.js';
+import { saveRecreatedTypeCategory } from './ticketPanelService.js';
 const TICKET_DELETE_DELAY_MS = 3000;
 const TICKET_DELETE_DELAY_SECONDS = Math.floor(TICKET_DELETE_DELAY_MS / 1000);
 const TICKET_SERVICE = 'ticketService';
@@ -79,7 +81,8 @@ export const getUserTicketCount = wrapServiceBoundary(async function getUserTick
   context: {},
 });
 
-export async function createTicket(guild, member, categoryId, reason = 'No reason provided', priority = 'none') {
+export async function createTicket(guild, member, categoryId, reason = 'No reason provided', priority = 'none', options = {}) {
+  const ticketType = options.type || null;
   try {
     const config = await getGuildConfig(guild.client, guild.id);
     const ticketConfig = config.tickets || {};
@@ -96,29 +99,44 @@ export async function createTicket(guild, member, categoryId, reason = 'No reaso
       );
     }
     
-    let category = categoryId ? 
-      guild.channels.cache.get(categoryId) :
-      guild.channels.cache.find(c => 
-        c.type === ChannelType.GuildCategory && 
-        c.name.toLowerCase().includes('tickets')
-      );
-    
-    if (!category && !categoryId) {
-      category = await guild.channels.create({
-        name: 'Tickets',
-        type: ChannelType.GuildCategory,
-        permissionOverwrites: [
-          {
-            id: guild.id,
-            deny: [PermissionFlagsBits.ViewChannel],
-          },
-        ],
-      });
+    let category;
+    if (ticketType) {
+      // Each ticket type has its own category (auto-created; re-created if someone deleted it).
+      const resolved = await resolveOpenCategory(guild, ticketType, config.ticketStaffRoleId);
+      category = resolved.category;
+      if (resolved.recreated) {
+        await saveRecreatedTypeCategory(guild.client, guild.id, ticketType.id, category.id).catch((error) => {
+          logger.warn(`Could not save re-created ticket category: ${error.message}`);
+        });
+      }
+    } else {
+      category = categoryId ?
+        guild.channels.cache.get(categoryId) :
+        guild.channels.cache.find(c =>
+          c.type === ChannelType.GuildCategory &&
+          c.name.toLowerCase().includes('tickets')
+        );
+
+      if (!category && !categoryId) {
+        category = await guild.channels.create({
+          name: 'Tickets',
+          type: ChannelType.GuildCategory,
+          permissionOverwrites: [
+            {
+              id: guild.id,
+              deny: [PermissionFlagsBits.ViewChannel],
+            },
+          ],
+        });
+      }
     }
     
     const ticketNumber = await getNextTicketNumber(guild.id);
     
-    let channelName = `ticket-${ticketNumber}`;
+    const paddedNumber = String(ticketNumber).padStart(4, '0');
+    let channelName = ticketType
+      ? `${slugify(ticketType.label)}-${paddedNumber}`
+      : `ticket-${ticketNumber}`;
     
     if (priority !== 'none') {
       const priorityInfo = PRIORITY_MAP[priority];
@@ -136,6 +154,18 @@ export async function createTicket(guild, member, categoryId, reason = 'No reaso
           id: guild.id,
           deny: [PermissionFlagsBits.ViewChannel],
         },
+        ...(guild.members.me ? [{
+          id: guild.members.me.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ManageMessages,
+            PermissionFlagsBits.EmbedLinks,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.ReadMessageHistory,
+          ],
+        }] : []),
         {
           id: member.id,
           allow: [
@@ -166,6 +196,7 @@ export async function createTicket(guild, member, categoryId, reason = 'No reaso
       claimedBy: null,
       priority: priority || 'none',
       reason,
+      ...(ticketType ? { typeId: ticketType.id, typeLabel: ticketType.label } : {}),
     };
     
     await saveTicketData(guild.id, channel.id, ticketData);
@@ -174,9 +205,10 @@ export async function createTicket(guild, member, categoryId, reason = 'No reaso
     
     const embed = createEmbed({
       title: `Ticket #${ticketNumber}`,
-      description: `${member.toString()}, thanks for creating a ticket!\n\n**Reason:** ${reason}\n**Priority:** ${priorityInfo.emoji} ${priorityInfo.label}`,
+      description: `${member.toString()}, thanks for creating a ticket!${ticketType?.description ? `\n> ${ticketType.description}` : ''}\n\n**Reason:** ${reason}\n**Priority:** ${priorityInfo.emoji} ${priorityInfo.label}`,
       color: priorityInfo.color,
       fields: [
+        ...(ticketType ? [{ name: 'Type', value: ticketType.label, inline: true }] : []),
         { name: 'Status', value: '🟢 Open', inline: true },
         { name: 'Claimed By', value: 'Not claimed', inline: true },
         { name: 'Created', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true },
@@ -519,7 +551,10 @@ export async function reopenTicket(channel, reopener) {
     }
 
     const config = await getGuildConfig(channel.client, channel.guild.id);
-    const openCategoryId = config.ticketCategoryId || null;
+    const reopenType = ticketData.typeId
+      ? (config.ticketPanel?.types || []).find((t) => t.id === ticketData.typeId)
+      : null;
+    const openCategoryId = reopenType?.categoryId || config.ticketCategoryId || null;
     let movedToOpenCategory = false;
     let openCategoryMoveFailed = false;
     

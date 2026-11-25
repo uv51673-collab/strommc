@@ -25,9 +25,11 @@ import { getGuildTicketStats } from '../../../utils/database/tickets.js';
 import { getUserTicketCount } from '../../../services/ticket.js';
 import {
     getTicketPanelStatus,
-    messageHasButtonCustomId,
+    messageHasTicketPanel,
     formatPanelStatusField,
 } from '../../../utils/panelStatus.js';
+import { buildPanelPayload, getPanelConfig } from '../../../utils/ticket/ticketPanel.js';
+import { refreshLivePanel } from '../../../services/ticketPanelService.js';
 import { startDashboardSession } from '../../../utils/dashboardSession.js';
 
 function buildButtonRow(guildConfig, guildId, disabled = false, panelStatus = null) {
@@ -79,23 +81,6 @@ async function persistPanelMessageId(client, guildId, guildConfig, messageId) {
     }
 }
 
-function buildPanelEmbed(config) {
-    return new EmbedBuilder()
-        .setTitle('Support Tickets')
-        .setDescription(config.ticketPanelMessage || 'Click the button below to create a support ticket.')
-        .setColor(getColor('info'));
-}
-
-function buildPanelButtonRow(config) {
-    return new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId('create_ticket')
-            .setLabel(config.ticketButtonLabel || 'Create Ticket')
-            .setStyle(ButtonStyle.Primary)
-            .setEmoji('📩'),
-    );
-}
-
 async function repostTicketPanel(client, guild, guildConfig, guildId) {
     const channel = await guild.channels.fetch(guildConfig.ticketPanelChannelId).catch(() => null);
     if (!channel) {
@@ -106,10 +91,7 @@ async function repostTicketPanel(client, guild, guildConfig, guildId) {
         );
     }
 
-    const sentPanel = await channel.send({
-        embeds: [buildPanelEmbed(guildConfig)],
-        components: [buildPanelButtonRow(guildConfig)],
-    });
+    const sentPanel = await channel.send(await buildPanelPayload(getPanelConfig(guildConfig)));
 
     await persistPanelMessageId(client, guildId, guildConfig, sentPanel.id);
     return sentPanel;
@@ -137,7 +119,10 @@ function buildDashboardEmbed(config, guild, panelStatus = null, ticketStats = nu
 
     const rawMsg = config.ticketPanelMessage || 'Click the button below to create a support ticket.';
     const panelMsg = `\`${rawMsg.length > 60 ? rawMsg.substring(0, 60) + '…' : rawMsg}\``;
-    const btnLabel = `\`${config.ticketButtonLabel || 'Create Ticket'}\``;
+    const panelTypes = getPanelConfig(config).types;
+    const ticketTypes = panelTypes.length
+        ? `${panelTypes.length} — manage with \`/ticket setup\``
+        : `\`${config.ticketButtonLabel || 'Create Ticket'}\``;
 
     let panelStatusValue = formatPanelStatusField(panelStatus);
 
@@ -160,7 +145,7 @@ function buildDashboardEmbed(config, guild, panelStatus = null, ticketStats = nu
             { name: 'Closed Tickets Category', value: closedCategory, inline: true },
             { name: '\u200B', value: '\u200B', inline: true },
             { name: 'Panel Message', value: panelMsg, inline: false },
-            { name: 'Button Label', value: btnLabel, inline: true },
+            { name: 'Ticket Buttons', value: ticketTypes, inline: true },
             { name: 'Max Tickets/User', value: String(config.maxTicketsPerUser || 3), inline: true },
             { name: 'DM on Close', value: config.dmOnClose !== false ? 'Enabled' : 'Disabled', inline: true },
             { name: 'Ticket Logs Channel', value: ticketLogsChannel, inline: true },
@@ -244,11 +229,7 @@ async function updateLivePanel(client, guild, config, guildId) {
         }
         if (!panelStatus.exists || !panelStatus.message) return false;
 
-        await panelStatus.message.edit({
-            embeds: [buildPanelEmbed(config)],
-            components: [buildPanelButtonRow(config)],
-        });
-        return true;
+        return await refreshLivePanel(client, guild, config);
     } catch (error) {
         logger.warn('Failed to update live ticket panel:', error.message);
         return false;
@@ -378,6 +359,7 @@ async function handlePanelMessage(selectInteraction, rootInteraction, guildConfi
 
     const newMessage = submitted.fields.getTextInputValue('panel_msg_input').trim();
     guildConfig.ticketPanelMessage = newMessage;
+    if (guildConfig.ticketPanel) guildConfig.ticketPanel.description = newMessage;
     await setGuildConfig(client, guildId, guildConfig);
 
     const panelUpdated = await updateLivePanel(client, rootInteraction.guild, guildConfig, guildId);
@@ -400,6 +382,14 @@ async function handlePanelMessage(selectInteraction, rootInteraction, guildConfi
 }
 
 async function handleButtonLabel(selectInteraction, rootInteraction, guildConfig, guildId, client) {
+    if ((guildConfig.ticketPanel?.types?.length || 0) > 1) {
+        await selectInteraction.reply({
+            embeds: [infoEmbed('Use the panel builder', 'This panel has several buttons. Rename, recolor, add or remove them with `/ticket setup`.')],
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
     const modal = new ModalBuilder()
         .setCustomId('ticket_cfg_btn_label')
         .setTitle('🏷️ Edit Button Label')
@@ -431,6 +421,7 @@ async function handleButtonLabel(selectInteraction, rootInteraction, guildConfig
 
     const newLabel = submitted.fields.getTextInputValue('btn_label_input').trim();
     guildConfig.ticketButtonLabel = newLabel;
+    if (guildConfig.ticketPanel?.types?.length === 1) guildConfig.ticketPanel.types[0].label = newLabel;
     await setGuildConfig(client, guildId, guildConfig);
 
     const panelUpdated = await updateLivePanel(client, rootInteraction.guild, guildConfig, guildId);
@@ -543,6 +534,8 @@ async function handleOpenCategory(selectInteraction, rootInteraction, guildConfi
         const category = catInteraction.channels.first();
 
         guildConfig.ticketCategoryId = category.id;
+        // single-button panels use this category directly; multi-button panels keep one category per button
+        if (guildConfig.ticketPanel?.types?.length === 1) guildConfig.ticketPanel.types[0].categoryId = category.id;
         await setGuildConfig(client, guildId, guildConfig);
 
         await catInteraction.followUp({
@@ -952,6 +945,7 @@ async function handleDeleteSystem(btnInteraction, rootInteraction, guildConfig, 
         'ticketCategoryId',
         'ticketClosedCategoryId',
         'ticketPanelMessage',
+        'ticketPanel',
         'ticketButtonLabel',
         'maxTicketsPerUser',
         'dmOnClose',
@@ -969,7 +963,7 @@ async function handleDeleteSystem(btnInteraction, rootInteraction, guildConfig, 
                     const messages = await panelChannel.messages.fetch({ limit: 50 }).catch(() => null);
                     if (messages) {
                         const found = messages.find(
-                            m => m.author.id === client.user.id && messageHasButtonCustomId(m, 'create_ticket'),
+                            m => m.author.id === client.user.id && messageHasTicketPanel(m),
                         );
                         if (found) await found.delete().catch(() => {});
                     }
