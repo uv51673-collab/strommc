@@ -1,7 +1,7 @@
 import { Events, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 import { getColor, botConfig } from '../config/bot.js';
 import { getWelcomeConfig, getUserApplications, deleteApplication } from '../utils/database.js';
-import { formatWelcomeMessage } from '../utils/welcome.js';
+import { formatWelcomeMessage, resolveEmbedImageUrl } from '../utils/welcome.js';
 import { logEvent, EVENT_TYPES } from '../services/loggingService.js';
 import { getServerCounters, updateCounter } from '../services/serverstatsService.js';
 import { getGuildBirthdays, deleteBirthday } from '../utils/database.js';
@@ -63,10 +63,14 @@ export default {
                         .setTimestamp()
                         .setFooter({ text: embedFooter });
 
-                    if (typeof welcomeConfig.leaveEmbed?.image === 'string') {
-                        embed.setImage(welcomeConfig.leaveEmbed.image);
-                    } else if (welcomeConfig.leaveEmbed?.image?.url) {
-                        embed.setImage(welcomeConfig.leaveEmbed.image.url);
+                    const imageUrl = await resolveEmbedImageUrl(
+                        member.client,
+                        typeof welcomeConfig.leaveEmbed?.image === 'string'
+                            ? welcomeConfig.leaveEmbed.image
+                            : welcomeConfig.leaveEmbed?.image?.url
+                    );
+                    if (imageUrl) {
+                        embed.setImage(imageUrl);
                     }
 
                     await channel.send({

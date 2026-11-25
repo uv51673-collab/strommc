@@ -2,7 +2,7 @@ import { Events, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 import { getColor, botConfig } from '../config/bot.js';
 import { getGuildConfig } from '../services/config/guildConfig.js';
 import { getWelcomeConfig } from '../utils/database.js';
-import { formatWelcomeMessage } from '../utils/welcome.js';
+import { formatWelcomeMessage, resolveEmbedImageUrl } from '../utils/welcome.js';
 import { logEvent, EVENT_TYPES } from '../services/loggingService.js';
 import { getServerCounters, updateCounter } from '../services/serverstatsService.js';
 import { setBirthday as dbSetBirthday } from '../utils/database.js';
@@ -64,10 +64,12 @@ export default {
                         .setTimestamp()
                         .setFooter({ text: embedFooter });
                     
-                    if (welcomeConfig.welcomeImage) {
-                        embed.setImage(welcomeConfig.welcomeImage);
-                    } else if (welcomeConfig.welcomeEmbed?.image?.url) {
-                        embed.setImage(welcomeConfig.welcomeEmbed.image.url);
+                    const imageUrl = await resolveEmbedImageUrl(
+                        member.client,
+                        welcomeConfig.welcomeImage || welcomeConfig.welcomeEmbed?.image?.url
+                    );
+                    if (imageUrl) {
+                        embed.setImage(imageUrl);
                     }
                     
                     await channel.send({ 

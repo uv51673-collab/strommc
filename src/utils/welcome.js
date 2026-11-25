@@ -71,3 +71,38 @@ export function getDefaultWelcomeMessage() {
 export function getDefaultGoodbyeMessage() {
     return DEFAULT_TEMPLATES.goodbye;
 }
+
+const DISCORD_CDN_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
+
+/**
+ * Returns a usable image URL for an embed, or null if there is none.
+ * Discord attachment links (e.g. images uploaded through the dashboard) are signed
+ * and expire after ~24h, which makes the welcome/goodbye photo disappear. We ask
+ * Discord for a freshly signed URL before sending. Any failure falls back to the
+ * stored URL so the message is still sent.
+ */
+export async function resolveEmbedImageUrl(client, rawUrl) {
+    if (typeof rawUrl !== 'string' || !rawUrl.trim()) return null;
+
+    let url;
+    try {
+        url = new URL(rawUrl.trim());
+        if (!['http:', 'https:'].includes(url.protocol)) return null;
+    } catch {
+        return null;
+    }
+
+    if (DISCORD_CDN_HOSTS.has(url.hostname) && url.pathname.startsWith('/attachments/')) {
+        try {
+            const res = await client.rest.post('/attachments/refresh-urls', {
+                body: { attachment_urls: [url.toString()] },
+            });
+            const refreshed = res?.refreshed_urls?.[0]?.refreshed;
+            if (refreshed) return refreshed;
+        } catch (error) {
+            logger.debug('Could not refresh Discord attachment URL:', error?.message || error);
+        }
+    }
+
+    return url.toString();
+}
