@@ -8,6 +8,7 @@ import { InteractionHelper } from '../utils/interactionHelper.js';
 import { checkRateLimit } from '../utils/rateLimiter.js';
 import { replyUserError, ErrorTypes, handleInteractionError, createError } from '../utils/errorHandler.js';
 import { getTicketPermissionContext } from '../utils/ticket/ticketPermissions.js';
+import { findTicketType, clip } from '../utils/ticket/ticketPanel.js';
 
 function escapeHtml(text) {
   if (!text) return '';
@@ -102,45 +103,59 @@ async function ensureTicketPermission(interaction, client, actionLabel, options 
   return context;
 }
 
+/**
+ * Opens the "why are you creating this ticket?" form for a ticket type.
+ * Shared by the panel buttons (`create_ticket:<typeId>`) and the dropdown.
+ */
+export async function openTicketModal(interaction, client, typeId) {
+  if (!(await ensureGuildContext(interaction))) return false;
+
+  const rateLimitKey = `${interaction.user.id}:create_ticket`;
+  const allowed = await checkRateLimit(rateLimitKey, 3, 60000);
+  if (!allowed) {
+    await replyUserError(interaction, { type: ErrorTypes.RATE_LIMIT, message: 'You are creating tickets too quickly. Please wait a minute and try again.' });
+    return false;
+  }
+
+  const config = await getGuildConfig(client, interaction.guildId);
+  const type = findTicketType(config, typeId);
+  if (!type) {
+    await replyUserError(interaction, { type: ErrorTypes.CONFIGURATION, message: 'This ticket option no longer exists. Please ask a staff member to repost the ticket panel.' });
+    return false;
+  }
+
+  const maxTicketsPerUser = config.maxTicketsPerUser || 3;
+
+  const { getUserTicketCount } = await import('../services/ticket.js');
+  const currentTicketCount = await getUserTicketCount(interaction.guildId, interaction.user.id);
+
+  if (currentTicketCount >= maxTicketsPerUser) {
+    await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: `You have reached the maximum number of open tickets (${maxTicketsPerUser}).\n\nPlease close your existing tickets before creating a new one.\n\n**Current Tickets:** ${currentTicketCount}/${maxTicketsPerUser}` });
+    return false;
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`create_ticket_modal:${type.id}`)
+    .setTitle(clip(`New ticket · ${type.label}`, 45));
+
+  const reasonInput = new TextInputBuilder()
+    .setCustomId('reason')
+    .setLabel('Why are you creating this ticket?')
+    .setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder('Describe your issue...')
+    .setRequired(true)
+    .setMaxLength(1000);
+
+  modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+  await interaction.showModal(modal);
+  return true;
+}
+
 const createTicketHandler = {
   name: 'create_ticket',
-  async execute(interaction, client) {
+  async execute(interaction, client, args = []) {
     try {
-      if (!(await ensureGuildContext(interaction))) return;
-
-      const rateLimitKey = `${interaction.user.id}:create_ticket`;
-      const allowed = await checkRateLimit(rateLimitKey, 3, 60000);
-      if (!allowed) {
-        await replyUserError(interaction, { type: ErrorTypes.RATE_LIMIT, message: 'You are creating tickets too quickly. Please wait a minute and try again.' });
-        return;
-      }
-
-      const config = await getGuildConfig(client, interaction.guildId);
-      const maxTicketsPerUser = config.maxTicketsPerUser || 3;
-      
-      const { getUserTicketCount } = await import('../services/ticket.js');
-      const currentTicketCount = await getUserTicketCount(interaction.guildId, interaction.user.id);
-      
-      if (currentTicketCount >= maxTicketsPerUser) {
-        return await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: `You have reached the maximum number of open tickets (${maxTicketsPerUser}).\n\nPlease close your existing tickets before creating a new one.\n\n**Current Tickets:** ${currentTicketCount}/${maxTicketsPerUser}` });
-      }
-      
-      const modal = new ModalBuilder()
-        .setCustomId('create_ticket_modal')
-        .setTitle('Create a Ticket');
-
-      const reasonInput = new TextInputBuilder()
-        .setCustomId('reason')
-        .setLabel('Why are you creating this ticket?')
-        .setStyle(TextInputStyle.Paragraph)
-        .setPlaceholder('Describe your issue...')
-        .setRequired(true)
-        .setMaxLength(1000);
-
-      const actionRow = new ActionRowBuilder().addComponents(reasonInput);
-      modal.addComponents(actionRow);
-
-      await interaction.showModal(modal);
+      await openTicketModal(interaction, client, args?.[0] || null);
     } catch (error) {
       logger.error('Error creating ticket modal:', error);
       if (!interaction.replied && !interaction.deferred) {
@@ -152,7 +167,7 @@ const createTicketHandler = {
 
 const createTicketModalHandler = {
   name: 'create_ticket_modal',
-  async execute(interaction, client) {
+  async execute(interaction, client, args = []) {
     try {
       if (!(await ensureGuildContext(interaction))) return;
 
@@ -161,13 +176,16 @@ const createTicketModalHandler = {
       
       const reason = interaction.fields.getTextInputValue('reason');
       const config = await getGuildConfig(client, interaction.guildId);
-      const categoryId = config.ticketCategoryId || null;
+      const type = findTicketType(config, args?.[0] || null);
+      const categoryId = type?.categoryId || config.ticketCategoryId || null;
       
       const { channel } = await createTicket(
         interaction.guild,
         interaction.member,
         categoryId,
-        reason
+        reason,
+        'none',
+        { type },
       );
       await interaction.editReply({
         embeds: [successEmbed(
