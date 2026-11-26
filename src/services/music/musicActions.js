@@ -14,7 +14,48 @@ import {
 } from './musicEmbeds.js';
 import { refreshPlayerMessage } from './playerHandler.js';
 
-const YOUTUBE_URL_PATTERN = /(?:youtube\.com|youtu\.be)/i;
+const YOUTUBE_HOSTS = new Set([
+    'youtube.com',
+    'www.youtube.com',
+    'm.youtube.com',
+    'music.youtube.com',
+    'youtu.be',
+]);
+
+/**
+ * Cleans a pasted YouTube link before it is sent to Lavalink.
+ * - A video link that also carries a playlist (`watch?v=ID&list=...`) plays only that video,
+ *   so pasting a song doesn't queue an entire mix. Pure playlist links (`/playlist?list=...`) stay playlists.
+ * - Tracking params (si, feature, pp, t...) are dropped.
+ * Anything that is not a YouTube URL is returned unchanged.
+ */
+export function normalizeYouTubeQuery(query) {
+    const text = String(query ?? '').trim();
+    if (!/^https?:\/\//i.test(text)) return text;
+
+    let url;
+    try {
+        url = new URL(text);
+    } catch {
+        return text;
+    }
+    if (!YOUTUBE_HOSTS.has(url.hostname.toLowerCase())) return text;
+
+    const isShortLink = url.hostname.toLowerCase() === 'youtu.be';
+    const shorts = url.pathname.match(/^\/(?:shorts|live|embed)\/([\w-]{11})/);
+    const videoId = isShortLink
+        ? url.pathname.slice(1).split('/')[0]
+        : (url.searchParams.get('v') || shorts?.[1] || null);
+    const listId = url.searchParams.get('list');
+
+    if (videoId && /^[\w-]{11}$/.test(videoId)) {
+        return `https://www.youtube.com/watch?v=${videoId}`;
+    }
+    if (listId && url.pathname.startsWith('/playlist')) {
+        return `https://www.youtube.com/playlist?list=${listId}`;
+    }
+    return text;
+}
 const PLAYER_CONNECT_TIMEOUT_MS = 12_000;
 
 function getConnectedLavalinkNodes(client) {
@@ -196,13 +237,7 @@ export async function joinVoiceChannel(client, interaction) {
 }
 
 export async function playQuery(client, interaction, query) {
-    if (YOUTUBE_URL_PATTERN.test(query)) {
-        throw new TitanBotError(
-            'YouTube URL blocked',
-            ErrorTypes.USER_INPUT,
-            'YouTube links are not supported. Try a song name instead.',
-        );
-    }
+    query = normalizeYouTubeQuery(query);
 
     const { player, guildData } = await ensurePlayer(client, interaction);
 
