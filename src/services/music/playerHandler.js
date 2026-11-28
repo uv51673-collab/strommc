@@ -10,6 +10,40 @@ import {
 const UPDATE_INTERVAL_MS = 15 * 1000;
 const IDLE_DISCONNECT_MS = 30 * 1000;
 
+/**
+ * YouTube often refuses playback from datacenter IPs ("Sign in to confirm you're not a bot").
+ * When a YouTube track fails to load, look the same song up on SoundCloud (which has no such block)
+ * and play that instead. Each track is retried at most once.
+ */
+async function tryFallbackPlayback(client, player, track) {
+    const info = track?.info;
+    if (!info || info.fallbackTried || !/youtube/i.test(info.sourceName || '')) {
+        return null;
+    }
+    info.fallbackTried = true;
+
+    const author = String(info.author || '').replace(/\s*-\s*topic$/i, '').trim();
+    const query = [info.title, author].filter(Boolean).join(' ').slice(0, 200);
+    if (!query) {
+        return null;
+    }
+
+    const result = await client.riffy.resolve({ query, source: 'scsearch', requester: info.requester });
+    const fallback = result?.tracks?.[0];
+    if (!fallback) {
+        return null;
+    }
+
+    fallback.info.requester = info.requester;
+    fallback.info.fallbackTried = true;
+    player.queue.add(fallback);
+
+    if (!player.playing && !player.paused) {
+        await player.play();
+    }
+    return fallback;
+}
+
 async function editOrSendPlayerMessage(client, guildData, channelId, embed, components) {
     const channel = client.channels.cache.get(channelId);
     if (!channel) {
@@ -226,11 +260,20 @@ export function setupPlayerHandler(client) {
     client.riffy.on('trackError', async (player, track, payload) => {
         logger.error(`Track error in ${player.guildId} for "${track?.info?.title}":`, payload?.error || payload);
         const guildData = getGuildMusicData(player.guildId);
-        if (guildData.playerChannelId) {
-            const channel = client.channels.cache.get(guildData.playerChannelId);
-            if (channel) {
-                channel.send(`Failed to play **${track?.info?.title || 'track'}**. Skipping...`).catch(() => null);
-            }
+        const channel = guildData.playerChannelId ? client.channels.cache.get(guildData.playerChannelId) : null;
+
+        let fallback = null;
+        try {
+            fallback = await tryFallbackPlayback(client, player, track);
+        } catch (error) {
+            logger.warn(`SoundCloud fallback failed for "${track?.info?.title}": ${error.message}`);
+        }
+
+        if (channel) {
+            const message = fallback
+                ? `YouTube blocked **${track?.info?.title || 'the track'}**, so I'm playing the closest match from SoundCloud: **${fallback.info.title}**.`
+                : `Failed to play **${track?.info?.title || 'track'}**. Skipping...`;
+            channel.send(message).catch(() => null);
         }
     });
 
